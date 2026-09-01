@@ -55,7 +55,7 @@ from scipy.optimize import linear_sum_assignment
 
 # A link is considered only if the time gap is short enough that a player
 # could not have gone far, and the predicted position lands near the candidate.
-MAX_GAP_SECONDS = 4.0
+MAX_GAP_SECONDS = 6.0
 # Tolerance on the predicted position, as a multiple of how far the player
 # could travel in the gap at a sprint (~8 m/s, ~26 px/m on ultrawide footage).
 PREDICT_TOLERANCE = 1.6
@@ -119,17 +119,20 @@ class Tracklet:
     """One continuous run of a single canonical id."""
 
     def __init__(self, tid: int, frames: List[int], xy: np.ndarray, cls: int,
-                 team: Optional[int] = None):
+                 team: Optional[int] = None,
+                 team_conf: Optional[float] = None,
+                 team_sep: float = 0.0):
         self.id = tid
         self.frames = frames
         self.xy = xy
         self.cls = cls
         # Optional team label. When both ends of a candidate link know their
-        # team and disagree, the link is impossible — a red shirt cannot
-        # continue a blue one. This roughly halves the candidate set, which is
-        # the largest single reduction in ambiguity available to us, but it
-        # depends on TEAM_CLASSIFICATION working. Left None until it does.
+        # team with high confidence and disagree under a strong kit separation,
+        # the link is HARD-VETOED. Weaker evidence only adds a soft penalty —
+        # see team_colour module docstring / TEAM_HARD_SEP_MIN.
         self.team = team
+        self.team_conf = team_conf
+        self.team_sep = team_sep
         self.start, self.end = frames[0], frames[-1]
 
     @property
@@ -195,13 +198,13 @@ def link_cost(a: Tracklet, b: Tracklet, fps: float,
     # uses most of the plausible travel budget is worse than one that barely
     # moves, regardless of how long the gap was.
     cost = dist / max(reach, 1e-6) + 0.25 * (gap_s / max_gap_seconds)
-    # Team disagreement is a PENALTY, not a veto. Colour labelling measured 93%
-    # per tracklet, so vetoing would forbid roughly one correct link in
-    # fourteen — and a forbidden correct link is invisible, it just leaves a
-    # player fragmented, whereas a penalty lets strong motion evidence overrule
-    # a doubtful colour call.
+    # Team disagreement: HARD veto when both ends are confident and kit
+    # separation is strong; otherwise a soft penalty (see team_colour).
     try:
-        from team_colour import team_penalty
+        from team_colour import team_penalty, team_hard_conflict
+        if team_hard_conflict(a.team, b.team, a.team_conf, b.team_conf,
+                              max(a.team_sep, b.team_sep)):
+            return None
         cost += team_penalty(a.team, b.team)
     except ImportError:
         pass

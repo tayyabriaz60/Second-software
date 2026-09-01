@@ -95,7 +95,10 @@ CONFIG = SoccerPitchConfiguration()
 # surviving short track is a real player briefly held rather than a phantom.
 # The movement test still guards against static furniture, which is the thing
 # this floor was really protecting against.
-MIN_SECONDS_TO_KEEP = 1.5
+# Raised 1.5→3.0s for production panoramic matches: most ID-explosion fragments
+# die well under 3s, while real players (and post-stitch identities) survive.
+# Transient shadow / touchline artifacts must not keep a "valid" identity.
+MIN_SECONDS_TO_KEEP = 3.0
 # Movement floor as a RATE, not a total. A fixed pixel count silently gets
 # stricter the shorter the clip: 500px is trivial over 143s but a lot over 30s,
 # so on a 30s render it filtered out ten players who were tracked the whole
@@ -108,7 +111,7 @@ MIN_SECONDS_TO_KEEP = 1.5
 # Set low on purpose. Keeping a bystander costs one row to dismiss during
 # manual validation; dropping a real player makes them invisible, and that
 # failure is much harder to notice.
-MIN_SPEED_PX_PER_SEC = 8.0
+MIN_SPEED_PX_PER_SEC = 10.0
 
 # ...but speed alone still discards goalkeepers, who patrol slowly and never
 # sprint. A keeper and a fence post can look identical by speed; they differ in
@@ -117,7 +120,12 @@ MIN_SPEED_PX_PER_SEC = 8.0
 #     goalkeeper  4.0 px/s, net displacement 187px
 #     static obj  5.1 px/s, net displacement   1px
 # So an ID is kept if it is quick enough OR it ended up somewhere else.
-MIN_NET_DISPLACEMENT_PX = 100
+# Stricter (100→150) to purge sideline coaches / parked spectators on long runs.
+MIN_NET_DISPLACEMENT_PX = 150
+# Reject tiny boxes before they ever enter ByteTrack — RF-DETR shadow noise and
+# partial crowd blobs often sit under ~18px and mint throwaway tracklets.
+MIN_BOX_HEIGHT_PX = 18
+MIN_BOX_WIDTH_PX = 8
 
 # Model input size. Players here are only ~45px tall in a 3024px-wide frame,
 # so at 1280 the model was seeing them at ~19px and missing roughly 4 of the
@@ -149,12 +157,19 @@ INFERENCE_CONF = 0.25
 #
 #   floor  activation   ids  alive>=90%  >=75%  >=50%
 #    0.40      0.25      50       5       13     20    <- old single-tier
-#    0.20      0.40      43       7       14     25    <- now
+#    0.20      0.40      43       7       14     25    <- previous
 #    0.15      0.45      40       7       14     19
 #    0.10      0.50      32       7       14     22
 #
-# Fewer ids AND better continuity together — those normally trade against each
-# other, so fragments are being rejoined rather than tracks suppressed.
+# Production tweak for ID explosion on long panoramic clips: keep a LOW detect
+# floor (weak tier continues tracks through shadow / soft RF-DETR scores) but
+# raise activation slightly so those weak boxes cannot mint new identities.
+# TRACK_DETECT_FLOOR is what get_player_detections keeps; activation is what
+# ByteTrack uses to open tracks. (Classic ByteTrack names map as:
+#   track_low_thresh ≈ TRACK_DETECT_FLOOR
+#   track_high_thresh / new_track_thresh ≈ TRACK_ACTIVATION_THRESHOLD
+#   match_thresh ≈ TRACK_MATCHING_THRESHOLD)
+TRACK_DETECT_FLOOR = 0.15
 # How many crops to keep per id for team colour, and how often to sample one.
 # 10 crops spread over a run is plenty for a majority vote, and consecutive
 # frames of one player are near-identical so sampling costs nothing in accuracy.
@@ -195,12 +210,39 @@ SPEED_WINDOW_SECONDS = 0.20
 TEAM_CROPS_PER_ID = 10
 TEAM_CROP_STRIDE = 8
 
-TRACK_ACTIVATION_THRESHOLD = 0.40
+# Slightly above the measured 0.40 sweet spot: harder to OPEN a track on a soft
+# shadow-edge detection, while TRACK_DETECT_FLOOR still lets those boxes
+# CONTINUE an existing one. Reduces ID minting without starving association.
+TRACK_ACTIVATION_THRESHOLD = 0.45
 # Matching gate for associating a detection with an existing track; higher is
 # more permissive. Swept 0.80/0.90/0.95/0.99 on the same clip: ids 55->52 and
 # alive>=75% 10->12. RF-DETR's boxes jitter more than the YOLO boxes ByteTrack's
 # 0.80 default was tuned against, so a moving player fell outside the gate.
 TRACK_MATCHING_THRESHOLD = 0.99
+# Require two hits before a brand-new ByteTrack id is emitted. Single-frame
+# RF-DETR flicker (tree shadow, duplicate query) was minting throwaway ids that
+# then survived long enough to look like "real" fragments in the dump.
+TRACK_MIN_CONSECUTIVE_FRAMES = 2
+# Bridge detector/occlusion holes of 1..N frames in id_history (linear +
+# constant-velocity coast). 10 frames covers ~0.18–0.33s depending on fps —
+# the regime where papers densify tracklets rather than letting association
+# open a duplicate identity. Does NOT invent online IDs; densifies existing
+# ones so stitch / speed / minimap see continuity.
+BRIDGE_MAX_FRAMES = 10
+# Sprint reference for adaptive Re-ID gating (px/sec on ultrawide). Fast
+# movers get a modestly wider gate; idle players stay tight (avoids the
+# measured failure mode of a flat growing radius).
+REID_SPRINT_PX_PER_SEC = 210.0
+REID_RADIUS_SPEED_GAIN = 0.40   # up to +40% radius at sprint
+REID_VELOCITY_DECAY = 0.88     # damp prediction under cuts / non-linear accel
+# Online CIELAB L-gap above which a lost-track candidate is rejected as the
+# wrong team (navy vs sky-blue kits). Below this, colour is ignored online.
+TEAM_LAB_HARD_DELTA = 28.0
+# When offline team separation is strong enough, opposing labels HARD-VETO a
+# stitch link (not just a soft penalty). Below this, keep soft penalty only —
+# 93% colour accuracy is too weak for a blanket veto.
+TEAM_HARD_SEP_MIN = 1.35
+TEAM_HARD_VOTE_FRAC = 0.70
 
 # Fold offline-stitched fragments into single identities after pass 1. On by
 # default: measured on 36s of 14_09 it joined ~44 fragments, and the stitcher
@@ -846,12 +888,24 @@ class PlayerReIDTracker:
         self.fps           = fps or 30.0
         self.window_frames = max(1, int(REID_WINDOW_SECONDS * self.fps))
         self.min_frames    = max(1, int(MIN_SECONDS_TO_KEEP * self.fps))
-        self.tracker = sv.ByteTrack(
-            minimum_consecutive_frames=1,
+        self.bridge_frames = max(2, int(BRIDGE_MAX_FRAMES))
+        self.team_sep: float = 0.0
+        self.team_vote_frac: dict = {}   # cid -> vote majority fraction
+        # frame_rate must match the video: without it ByteTrack assumes 30fps
+        # and its internal time-based buffers drift on 50/55fps screen captures,
+        # killing tracks early and minting replacement ids.
+        bt_kwargs = dict(
+            minimum_consecutive_frames=TRACK_MIN_CONSECUTIVE_FRAMES,
             lost_track_buffer=self.window_frames,
             track_activation_threshold=TRACK_ACTIVATION_THRESHOLD,
             minimum_matching_threshold=TRACK_MATCHING_THRESHOLD,
         )
+        try:
+            self.tracker = sv.ByteTrack(
+                **bt_kwargs, frame_rate=max(1, int(round(self.fps))))
+        except TypeError:
+            # Older supervision builds omit frame_rate.
+            self.tracker = sv.ByteTrack(**bt_kwargs)
         self.frame_diag = np.sqrt(frame_width**2 + frame_height**2)
         self.frame_w    = frame_width
         self.frame_h    = frame_height
@@ -863,6 +917,7 @@ class PlayerReIDTracker:
         self.id_path_px:     defaultdict = defaultdict(float)
         self.id_sample_pos:  dict = {}   # cid -> (x, y, frame) last sampled
         self.id_appearance:  dict = {}   # cid -> SigLIP embedding
+        self.id_lab:         dict = {}   # cid -> EMA CIELAB torso colour
         self.id_class_votes: defaultdict = defaultdict(lambda: defaultdict(int))
         self.id_history:     defaultdict = defaultdict(list)   # cid -> [(frame,x,y)]
         self.id_crops:       defaultdict = defaultdict(list)   # cid -> [crop]
@@ -909,15 +964,56 @@ class PlayerReIDTracker:
         na, nb = np.linalg.norm(a), np.linalg.norm(b)
         return float(a @ b / (na * nb)) if na and nb else None
 
-    def _find_lost_match(self, cx, cy, emb=None):
+    def _exit_velocity(self, cid, n: int = 8) -> np.ndarray:
+        """px/frame velocity from the tail of id_history, or zeros."""
+        hist = self.id_history.get(cid)
+        if not hist or len(hist) < 2:
+            return np.zeros(2, dtype=np.float64)
+        tail = hist[-min(n + 1, len(hist)):]
+        span = tail[-1][0] - tail[0][0]
+        if span <= 0:
+            return np.zeros(2, dtype=np.float64)
+        return np.array([
+            (tail[-1][1] - tail[0][1]) / span,
+            (tail[-1][2] - tail[0][2]) / span,
+        ], dtype=np.float64)
+
+    def _adaptive_radius(self, cid, frames_ago: int) -> float:
+        """Spatial gate scaled by own speed — not a flat growing radius.
+
+        Soccer MOT literature widens association covariance for high-velocity
+        targets (sprints / cuts leave larger residual after a miss). A flat
+        radius grown with gap length previously exploded IDs on this footage;
+        scaling by the track's own speed keeps idle players tightly gated while
+        giving runners room to reclaim after a mid-pitch dropout.
+        """
+        base = REID_DISTANCE_FRACTION * self.frame_diag
+        speed = float(np.linalg.norm(self._exit_velocity(cid))) * self.fps
+        speed_scale = 1.0 + REID_RADIUS_SPEED_GAIN * min(
+            1.0, speed / max(REID_SPRINT_PX_PER_SEC, 1e-6))
+        # Tiny extra slack for longer gaps (occlusion uncertainty), capped.
+        gap_scale = 1.0 + 0.15 * min(1.0, frames_ago / max(self.window_frames, 1))
+        return base * speed_scale * gap_scale
+
+    def _lab_team_conflict(self, cid, det_lab) -> bool:
+        """True if detection CIELAB conflicts hard with the lost track's kit."""
+        if det_lab is None:
+            return False
+        prev = self.id_lab.get(cid)
+        if prev is None:
+            return False
+        # Navy vs sky-blue kits separate primarily on L; require a large gap
+        # before vetoing so shade-induced L drops don't block same-player reclaim.
+        return abs(float(det_lab[0]) - float(prev[0])) >= TEAM_LAB_HARD_DELTA
+
+    def _find_lost_match(self, cx, cy, emb=None, det_lab=None):
         """Find which lost track this detection most likely continues.
 
-        Candidates must fall inside the spatial radius — see
-        REID_DISTANCE_FRACTION for the tighter variants that measured worse.
-        Among those, appearance breaks the tie; see APPEARANCE_WEIGHT for why
-        it ranks rather than vetoes.
+        Association uses a damped constant-velocity prediction (handles cuts
+        better than pure ballistic coast) inside an adaptive speed-scaled gate,
+        with an optional CIELAB team hard-veto so opposing kits cannot steal an
+        id across a dropout.
         """
-        radius = REID_DISTANCE_FRACTION * self.frame_diag
         best_id, best_score = None, -1.0
         for cid, (lx, ly, last_frame) in self.last_seen.items():
             frames_ago = self.frame_n - last_frame
@@ -929,7 +1025,16 @@ class PlayerReIDTracker:
                 continue
             if cid in self._claimed_this_frame:
                 continue
-            dist = np.sqrt((cx-lx)**2 + (cy-ly)**2)
+            if self._lab_team_conflict(cid, det_lab):
+                continue
+            vel = self._exit_velocity(cid)
+            # Decay velocity over the gap so a pre-cut sprint does not overshoot
+            # after a sharp direction change (common failure of plain Kalman CV).
+            damp = REID_VELOCITY_DECAY ** max(0, frames_ago - 1)
+            pred_x = lx + vel[0] * frames_ago * damp
+            pred_y = ly + vel[1] * frames_ago * damp
+            dist = np.sqrt((cx - pred_x) ** 2 + (cy - pred_y) ** 2)
+            radius = self._adaptive_radius(cid, frames_ago)
             if dist >= radius:
                 continue
 
@@ -941,6 +1046,40 @@ class PlayerReIDTracker:
             if score > best_score:
                 best_score, best_id = score, cid
         return best_id
+
+    def interpolate_short_gaps(self) -> int:
+        """Fill holes of 2..BRIDGE_MAX_FRAMES in each id_history.
+
+        Uses linear interpolation in (x, y, box_h). Online ByteTrack already
+        keeps lost tracks alive via lost_track_buffer; this densifies the
+        recorded trajectory so offline stitch / physics / minimap do not treat
+        a 3–10 frame detector miss as a tracklet break.
+        """
+        filled = 0
+        max_gap = self.bridge_frames
+        for cid, hist in list(self.id_history.items()):
+            if len(hist) < 2:
+                continue
+            hist = sorted(hist)
+            out = [hist[0]]
+            for prev, cur in zip(hist, hist[1:]):
+                gap = int(cur[0] - prev[0])
+                if 2 <= gap <= max_gap:
+                    for k in range(1, gap):
+                        t = k / gap
+                        bh_p = float(prev[3]) if len(prev) > 3 else 0.0
+                        bh_c = float(cur[3]) if len(cur) > 3 else bh_p
+                        out.append((
+                            int(prev[0] + k),
+                            float(prev[1] + t * (cur[1] - prev[1])),
+                            float(prev[2] + t * (cur[2] - prev[2])),
+                            float(bh_p + t * (bh_c - bh_p)),
+                        ))
+                        filled += 1
+                        self.id_frame_count[cid] += 1
+                out.append(cur)
+            self.id_history[cid] = out
+        return filled
 
     def _accumulate_path(self, cid, cx, cy):
         """Add this ID's travel since its last sampled position.
@@ -1004,11 +1143,23 @@ class PlayerReIDTracker:
             raw_id = int(raw_id)
             cx, cy = self._centre(detections.xyxy[i])
             emb = embeddings.get(i)
+            det_lab = None
+            x1 = y1 = x2 = y2 = None
+            if frame is not None:
+                x1, y1, x2, y2 = [int(v) for v in detections.xyxy[i]]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                if x2 - x1 >= 8 and y2 - y1 >= 16:
+                    try:
+                        from team_colour import torso_colour
+                        det_lab = torso_colour(frame[y1:y2, x1:x2])
+                    except Exception:
+                        det_lab = None
 
             if raw_id in self.id_map:
                 cid = self.id_map[raw_id]
             else:
-                matched = self._find_lost_match(cx, cy, emb)
+                matched = self._find_lost_match(cx, cy, emb, det_lab=det_lab)
                 cid     = matched if matched is not None else raw_id
                 self.id_map[raw_id] = cid
 
@@ -1036,6 +1187,11 @@ class PlayerReIDTracker:
                 self.id_appearance[cid] = (
                     emb if prev is None else 0.7 * prev + 0.3 * emb)
                 self.id_embed_frame[cid] = self.frame_n
+            if det_lab is not None:
+                prev_lab = self.id_lab.get(cid)
+                self.id_lab[cid] = (
+                    det_lab if prev_lab is None
+                    else (0.7 * prev_lab + 0.3 * det_lab).astype(np.float32))
             self.id_frame_count[cid] += 1
             if detections.class_id is not None:
                 self.id_class_votes[cid][int(detections.class_id[i])] += 1
@@ -1045,12 +1201,9 @@ class PlayerReIDTracker:
             # Keep a few crops per id for team colour. Sampled, not every
             # frame: consecutive crops of one player are near-identical, so
             # they add memory without adding evidence.
-            if (STITCH and frame is not None and
+            if (STITCH and frame is not None and x1 is not None and
                     len(self.id_crops[cid]) < TEAM_CROPS_PER_ID and
                     self.frame_n % TEAM_CROP_STRIDE == 0):
-                x1, y1, x2, y2 = [int(v) for v in detections.xyxy[i]]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
                 if x2 - x1 >= 8 and y2 - y1 >= 16:
                     self.id_crops[cid].append(frame[y1:y2, x1:x2].copy())
             if TRACK_DUMP or STITCH:
@@ -1230,19 +1383,25 @@ class PlayerReIDTracker:
         # veto, because the labelling is ~93% and a wrong veto silently leaves
         # a player fragmented.
         self.id_team = {}
+        self.team_vote_frac = {}
+        self.team_sep = 0.0
         try:
             from team_colour import TeamColourClassifier
             crops_all = [c for v in self.id_crops.values() for c in v]
             if len(crops_all) >= 20:
                 clf = TeamColourClassifier().fit(crops_all)
+                self.team_sep = float(clf.separation)
                 if clf.centres is not None and clf.separation >= 1.0:
                     for cid, crops in self.id_crops.items():
-                        t = clf.predict_tracklet(crops)
+                        t, frac = clf.predict_tracklet_confident(crops)
                         if t is not None:
                             self.id_team[cid] = t
+                            self.team_vote_frac[cid] = frac
                     counts = Counter(self.id_team.values())
+                    hard = (clf.separation >= TEAM_HARD_SEP_MIN)
                     print(f"Team colour: separation {clf.separation:.2f}, "
-                          f"{dict(counts)} across {len(self.id_team)} ids")
+                          f"{dict(counts)} across {len(self.id_team)} ids"
+                          f"{' [HARD veto armed]' if hard else ' [soft penalty]'}")
                 else:
                     sep = clf.separation if clf.centres is not None else 0.0
                     print(f"Team colour: separation {sep:.2f} — kits too "
@@ -1265,7 +1424,9 @@ class PlayerReIDTracker:
                     tracklets.append(stitch.Tracklet(
                         cid, frames[a:b], xy[a:b],
                         self.dominant_class(cid) or PLAYER_CLASS_ID,
-                        team=self.id_team.get(cid)))
+                        team=self.id_team.get(cid),
+                        team_conf=self.team_vote_frac.get(cid),
+                        team_sep=self.team_sep))
         if len(tracklets) < 2:
             return 0, 0
 
@@ -1402,17 +1563,26 @@ def run_player_tracking(
         """
         if DETECTOR == 'rfdetr':
             import rfdetr_onnx
-            return rfdetr_onnx.detect(frame, conf=min(INFERENCE_CONF,
+            # Request at the WEAK-tier floor so soft shadow-edge boxes still
+            # reach ByteTrack; activation (not this conf) decides new tracks.
+            return rfdetr_onnx.detect(frame, conf=min(TRACK_DETECT_FLOOR,
                                                       BALL_MIN_CONF))
         result = model(frame, imgsz=INFERENCE_IMGSZ,
-                       conf=min(INFERENCE_CONF, BALL_MIN_CONF),
+                       conf=min(TRACK_DETECT_FLOOR, BALL_MIN_CONF),
                        agnostic_nms=True, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
     def get_player_detections(frame, raw=None):
         detections = detect_raw(frame) if raw is None else raw
         if len(detections) and detections.confidence is not None:
-            detections = detections[detections.confidence >= INFERENCE_CONF]
+            # Keep the weak tier (TRACK_DETECT_FLOOR .. ACTIVATION) so ByteTrack
+            # can CONTINUE tracks through shadow; do NOT filter at activation.
+            detections = detections[detections.confidence >= TRACK_DETECT_FLOOR]
+        if len(detections):
+            h = detections.xyxy[:, 3] - detections.xyxy[:, 1]
+            w = detections.xyxy[:, 2] - detections.xyxy[:, 0]
+            detections = detections[
+                (h >= MIN_BOX_HEIGHT_PX) & (w >= MIN_BOX_WIDTH_PX)]
         detections = clean_detections(
             detections, video_info.width, video_info.height)
         if detections.class_id is not None and len(detections) > 0:
@@ -1501,6 +1671,10 @@ def run_player_tracking(
                                      float(b.xyxy[0][3])))
 
     raw_id_count = len(tracker1.id_frame_count)
+    n_bridged = tracker1.interpolate_short_gaps()
+    if n_bridged:
+        print(f"\nGap bridge: filled {n_bridged} missing sample(s) "
+              f"(≤{BRIDGE_MAX_FRAMES} frames detector/occlusion dropouts)")
     if SPLIT_IMPLAUSIBLE:
         # Cut BEFORE stitching: undo bad splices first, then let stitching
         # re-link the pieces on their own evidence (including team colour).
@@ -2052,7 +2226,11 @@ def main(
                   f"clips the near half of the pitch still produces plausible "
                   f"detection counts.")
     print(f"Start frame: {START_FRAME}")
-    print(f"Detector: {DETECTOR}  imgsz: {INFERENCE_IMGSZ}  conf: {INFERENCE_CONF}  touchline buffer: {TOUCHLINE_BUFFER_PX}px")
+    print(f"Detector: {DETECTOR}  imgsz: {INFERENCE_IMGSZ}  "
+          f"detect_floor: {TRACK_DETECT_FLOOR}  "
+          f"activation: {TRACK_ACTIVATION_THRESHOLD}  "
+          f"match: {TRACK_MATCHING_THRESHOLD}  "
+          f"touchline buffer: {TOUCHLINE_BUFFER_PX}px")
 
     if max_frames:
         print(f"Limiting to the first {max_frames} frames.")
@@ -2167,11 +2345,10 @@ if __name__ == '__main__':
     if args.detector:
         DETECTOR = args.detector
         if args.conf is None and args.detector == 'rfdetr':
-            # This is the floor for the WEAK tier, not the working threshold —
-            # see TRACK_ACTIVATION_THRESHOLD, which is what actually decides
-            # when a new track may open. Detections between 0.20 and 0.40 are
-            # passed to the tracker so they can continue a track a confident
-            # detection already started.
+            # INFERENCE_CONF stays as the documented "working" conf for logs /
+            # YOLO modes. PLAYER_TRACKING itself feeds ByteTrack at
+            # TRACK_DETECT_FLOOR (weak tier) and opens tracks only above
+            # TRACK_ACTIVATION_THRESHOLD — see those constants.
             #
             # A single-tier sweep (everything below the floor discarded) put the
             # best value at 0.40 — 22.3 dets/frame against ~22 players, where
@@ -2182,9 +2359,10 @@ if __name__ == '__main__':
             # per-frame id invariant in place.
             #
             # Splitting the tiers is what made the lower floor pay: the same
-            # 0.20-0.40 detections that hurt as track seeds help as track
+            # soft detections that hurt as track seeds help as track
             # continuations.
             INFERENCE_CONF = 0.20
+            TRACK_DETECT_FLOOR = 0.15
     if args.start_frame:
         START_FRAME = args.start_frame
     if args.start_seconds:
