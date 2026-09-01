@@ -1377,7 +1377,11 @@ def run_player_tracking(
     max_frames: int = None,
     no_render: bool = False
 ) -> Iterator[np.ndarray]:
-    model      = load_player_model(device)
+    # RF-DETR path never calls the Ultralytics YOLO weights. Loading them here
+    # only to discard them forces football-player-detection.pt onto every
+    # --detector rfdetr run. Class IDs stay at the module defaults, which already
+    # match rfdetr_onnx._CLASS_MAP (ball=0, gk=1, player=2, ref=3).
+    model = None if DETECTOR == 'rfdetr' else load_player_model(device)
     video_info = sv.VideoInfo.from_video_path(source_video_path)
     fps        = video_info.fps or 30
 
