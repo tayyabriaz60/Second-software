@@ -237,7 +237,11 @@ TRACK_DUMP = False
 # Re-identification. These are expressed in seconds because frame counts mean
 # different things on 30fps and 57fps footage — the old fixed 150-frame window
 # was 5s as intended at 30fps but only 2.6s here.
-REID_WINDOW_SECONDS = 5.0   # how long a lost track stays re-identifiable
+#
+# Raised 5s→10s (≡150→300 frames @ 30fps) so mid-pitch dropouts and tree-shadow
+# misses can still reclaim the same canonical id instead of minting duplicates
+# (IDs climbing past 500 on long clips).
+REID_WINDOW_SECONDS = 10.0   # how long a lost track stays re-identifiable
 
 # Spatial gating for re-id, as a fraction of the frame diagonal (~394px here).
 #
@@ -252,7 +256,10 @@ REID_WINDOW_SECONDS = 5.0   # how long a lost track stays re-identifiable
 #     a new ID instead.
 # The flat radius does over-merge occasionally (one ID landing on two players),
 # which is worth revisiting — but with appearance features, not geometry.
-REID_DISTANCE_FRACTION = 0.12
+#
+# Raised 0.12→0.15 so shadowed / briefly displaced players still fall inside
+# the reclaim radius after a dropout (trade-off: slightly higher over-merge risk).
+REID_DISTANCE_FRACTION = 0.15
 
 # How long a track must have been unseen before another detection may adopt its
 # canonical id. Previously any track not seen THIS frame was fair game, so a
