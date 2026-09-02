@@ -99,19 +99,16 @@ SPRINT_PX_PER_SEC = 210.0
 NO_LINK_COST = 0.30
 
 # A link whose next-best alternative was within this fraction of its own cost
-# is thin evidence. It is still made — global assignment has already weighed
-# the knock-on constraints, which is more information than the old greedy
-# refusal had — but it is flagged for the human pass.
-#
-# This flag is the most useful output of the whole module. Measured against
-# manufactured ground truth, links from cut pieces split cleanly:
+# is thin evidence. Global assignment still proposes it, but by default the
+# pipeline DECLINES thin links (see keep_thin / STITCH_KEEP_THIN) because
+# measured correctness collapses:
 #
 #   confident       93% correct
 #   thin (flagged)  29% correct
 #
 # The margin over the runner-up predicts correctness far better than the
-# absolute cost does, which is what makes a targeted manual pass possible:
-# review the thin third rather than all of it.
+# absolute cost does. Thin links remain in the returned `links` list for
+# audit even when not applied.
 THIN_MARGIN_RATIO = 0.85
 
 
@@ -229,7 +226,8 @@ def build_cost_matrix(tracklets: Sequence[Tracklet], fps: float,
 def stitch_global(tracklets: Sequence[Tracklet], fps: float,
                   no_link_cost: float = NO_LINK_COST,
                   max_gap_seconds: float = MAX_GAP_SECONDS,
-                  cost: Optional[np.ndarray] = None):
+                  cost: Optional[np.ndarray] = None,
+                  keep_thin: bool = True):
     """Assign successors globally: the cheapest consistent set of links.
 
     Formulated as a rectangular assignment problem. Rows are tracklets choosing
@@ -239,6 +237,10 @@ def stitch_global(tracklets: Sequence[Tracklet], fps: float,
     ending the chain, and — the point of doing it globally — will decline a
     locally attractive link when taking it would force a worse assignment
     somewhere else.
+
+    keep_thin: when False, thin-margin links are reported but NOT applied
+    (mot_sota_v3: thin links ~29% correct vs ~93% confident). Prefer leaving
+    fragments over silent wrong welds.
 
     Returns (identities, links), where identities are chains of tracklet
     indices and links carry the margin over the next-best alternative.
@@ -262,7 +264,6 @@ def stitch_global(tracklets: Sequence[Tracklet], fps: float,
     for i, j in zip(rows, cols):
         if j >= n or not np.isfinite(cost[i, j]):
             continue                              # chain ends here
-        successor[i] = j
         # Margin: how much worse the runner-up was. Compare against the best
         # alternative FOR THIS ROW and the best alternative claim ON THIS
         # COLUMN — a link is only well-evidenced if neither side had a close
@@ -275,6 +276,9 @@ def stitch_global(tracklets: Sequence[Tracklet], fps: float,
                       'cost': float(cost[i, j]),
                       'runner_up': float(alt) if np.isfinite(alt) else None,
                       'thin': bool(thin)})
+        if thin and not keep_thin:
+            continue                              # decline; leave fragmented
+        successor[i] = j
 
     claimed = set(successor.values())
     identities = []

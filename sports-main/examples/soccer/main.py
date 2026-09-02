@@ -206,6 +206,13 @@ MAX_BODY_HEIGHTS_PER_SEC = 9.0
 # Baseline over which speed is measured. Long enough that detection jitter
 # averages out, short enough that a real teleport still registers.
 SPEED_WINDOW_SECONDS = 0.20
+# Path-efficiency split: catches SLOW identity welds that never teleport in one
+# hop (mot_sota_v3 id 367: path/net ≈ 777 while speed stayed "human"). Over a
+# rolling window, if cumulative path ≫ straight-line net, the track is visiting
+# two players. Cut at the farthest point from the chord.
+EFFICIENCY_WINDOW_SECONDS = 3.0
+MAX_PATH_NET_RATIO = 12.0
+MIN_EFFICIENCY_PATH_PX = 200.0
 
 TEAM_CROPS_PER_ID = 10
 TEAM_CROP_STRIDE = 8
@@ -218,11 +225,12 @@ TRACK_ACTIVATION_THRESHOLD = 0.45
 # more permissive. Swept 0.80/0.90/0.95/0.99 on the same clip: ids 55->52 and
 # alive>=75% 10->12. RF-DETR's boxes jitter more than the YOLO boxes ByteTrack's
 # 0.80 default was tuned against, so a moving player fell outside the gate.
-TRACK_MATCHING_THRESHOLD = 0.99
+# Cap below 0.99: ultra-permissive matching was a contributor to gradual welds.
+TRACK_MATCHING_THRESHOLD = 0.95
 # Require two hits before a brand-new ByteTrack id is emitted. Single-frame
 # RF-DETR flicker (tree shadow, duplicate query) was minting throwaway ids that
 # then survived long enough to look like "real" fragments in the dump.
-TRACK_MIN_CONSECUTIVE_FRAMES = 2
+TRACK_MIN_CONSECUTIVE_FRAMES = 3
 # Bridge detector/occlusion holes of 1..N frames in id_history (linear +
 # constant-velocity coast). 10 frames covers ~0.18–0.33s depending on fps —
 # the regime where papers densify tracklets rather than letting association
@@ -233,8 +241,8 @@ BRIDGE_MAX_FRAMES = 10
 # movers get a modestly wider gate; idle players stay tight (avoids the
 # measured failure mode of a flat growing radius).
 REID_SPRINT_PX_PER_SEC = 210.0
-REID_RADIUS_SPEED_GAIN = 0.40   # up to +40% radius at sprint
-REID_VELOCITY_DECAY = 0.88     # damp prediction under cuts / non-linear accel
+REID_RADIUS_SPEED_GAIN = 0.20   # was 0.40 — tighter to cut wrong reclaim
+REID_VELOCITY_DECAY = 0.85
 # Online CIELAB L-gap above which a lost-track candidate is rejected as the
 # wrong team (navy vs sky-blue kits). Below this, colour is ignored online.
 TEAM_LAB_HARD_DELTA = 28.0
@@ -249,6 +257,10 @@ TEAM_HARD_VOTE_FRAC = 0.70
 # declines rather than guesses (see stitch_tracks.NO_LINK_COST). Turn off with
 # --no_stitch to see the raw online tracker.
 STITCH = True
+# Thin stitch links measured ~29% correct vs ~93% for confident ones
+# (mot_sota_v3: 106 thin). Drop them by default — fragmentation beats silent
+# wrong merges that create welds like id 367.
+STITCH_KEEP_THIN = False
 
 # Which detector to use. 'yolo' is our local ultralytics weights; 'rfdetr' is
 # the Roboflow football-players v20 transformer, which handles this footage far
@@ -299,9 +311,9 @@ REID_WINDOW_SECONDS = 10.0   # how long a lost track stays re-identifiable
 # The flat radius does over-merge occasionally (one ID landing on two players),
 # which is worth revisiting — but with appearance features, not geometry.
 #
-# Raised 0.12→0.15 so shadowed / briefly displaced players still fall inside
-# the reclaim radius after a dropout (trade-off: slightly higher over-merge risk).
-REID_DISTANCE_FRACTION = 0.15
+# Raised 0.12→0.15 then pulled back to 0.12 after mot_sota_v3: wider gates
+# reduced dropouts but fed wrong reclaim + collision-split (100xxx) explosion.
+REID_DISTANCE_FRACTION = 0.12
 
 # How long a track must have been unseen before another detection may adopt its
 # canonical id. Previously any track not seen THIS frame was fair game, so a
@@ -1006,7 +1018,7 @@ class PlayerReIDTracker:
         # before vetoing so shade-induced L drops don't block same-player reclaim.
         return abs(float(det_lab[0]) - float(prev[0])) >= TEAM_LAB_HARD_DELTA
 
-    def _find_lost_match(self, cx, cy, emb=None, det_lab=None):
+    def _find_lost_match(self, cx, cy, emb=None, det_lab=None, exclude=None):
         """Find which lost track this detection most likely continues.
 
         Association uses a damped constant-velocity prediction (handles cuts
@@ -1014,6 +1026,7 @@ class PlayerReIDTracker:
         with an optional CIELAB team hard-veto so opposing kits cannot steal an
         id across a dropout.
         """
+        exclude = exclude or set()
         best_id, best_score = None, -1.0
         for cid, (lx, ly, last_frame) in self.last_seen.items():
             frames_ago = self.frame_n - last_frame
@@ -1023,7 +1036,7 @@ class PlayerReIDTracker:
             # point before this guard existed.
             if frames_ago < REID_MIN_LOST_FRAMES or frames_ago > self.window_frames:
                 continue
-            if cid in self._claimed_this_frame:
+            if cid in self._claimed_this_frame or cid in exclude:
                 continue
             if self._lab_team_conflict(cid, det_lab):
                 continue
@@ -1172,11 +1185,19 @@ class PlayerReIDTracker:
             # at least one doubled id, and every case came from a mapping made
             # earlier — so preventing it at adoption time is not enough.
             #
-            # Whoever arrives second gets a fresh id. A split is visible and
-            # fixable later; a merge silently blends two players' positions.
+            # Prefer reclaiming a DIFFERENT lost track over minting a 100xxx
+            # collision-split id (mot_sota_v3: 227 of 317 passed IDs were
+            # ≥100000). Fresh mint is last resort — a split is still safer than
+            # a silent weld, but minting is what drove ID explosion.
             if cid in used_this_frame:
-                cid = self._next_free_id()
+                alt = self._find_lost_match(
+                    cx, cy, emb, det_lab=det_lab, exclude=used_this_frame)
+                if alt is not None and alt not in used_this_frame:
+                    cid = alt
+                else:
+                    cid = self._next_free_id()
                 self.id_map[raw_id] = cid
+                self._claimed_this_frame.add(cid)
             used_this_frame.add(cid)
             canonical_ids.append(cid)
             self.last_seen[cid] = (cx, cy, self.frame_n)
@@ -1247,6 +1268,50 @@ class PlayerReIDTracker:
         fx, fy = self.id_first_pos[cid]
         lx, ly = self.id_last_pos[cid]
         return float(np.sqrt((lx - fx) ** 2 + (ly - fy) ** 2))
+
+    def path_net_ratio(self, cid) -> float:
+        """Cumulative path / straight-line net. High values flag identity welds."""
+        net = self.net_displacement(cid)
+        path = float(self.id_path_px.get(cid, 0.0))
+        if net < 1.0:
+            return path  # unbounded wandering with no net progress
+        return path / net
+
+    def _apply_track_cuts(self, cid, hist, cuts) -> int:
+        """Rewrite state so each cut boundary becomes a new canonical id."""
+        if not cuts:
+            return 0
+        boundaries = []
+        for c in cuts:
+            new_cid = self._next_free_id()
+            boundaries.append((hist[c][0], new_cid))
+        existing = list(self.id_splits.get(cid, []))
+        existing.extend(boundaries)
+        self.id_splits[cid] = existing
+
+        segs, start = [], 0
+        for c in cuts + [len(hist)]:
+            segs.append(hist[start:c])
+            start = c
+        ids = [cid] + [b[1] for b in boundaries]
+        for seg_id, seg in zip(ids, segs):
+            if not seg:
+                continue
+            self.id_history[seg_id] = seg
+            self.id_frame_count[seg_id] = len(seg)
+            self.id_first_pos[seg_id] = (seg[0][1], seg[0][2])
+            self.id_last_pos[seg_id] = (seg[-1][1], seg[-1][2])
+            if seg_id != cid:
+                self.id_class_votes[seg_id][self.dominant_class(cid) or
+                                            PLAYER_CLASS_ID] = len(seg)
+                self.id_crops[seg_id] = self.id_crops.get(cid, [])[:]
+                if cid in self.id_team:
+                    self.id_team[seg_id] = self.id_team[cid]
+            path = 0.0
+            for a, b in zip(seg[:-1], seg[1:]):
+                path += float(np.hypot(b[1] - a[1], b[2] - a[2]))
+            self.id_path_px[seg_id] = path
+        return len(cuts)
 
     def split_implausible_tracks(self, fps: float):
         """Cut a track where it moves faster than a human can run.
@@ -1322,39 +1387,73 @@ class PlayerReIDTracker:
             # spurious identity.
             cuts = [c for k, c in enumerate(cuts)
                     if k == 0 or c - cuts[k - 1] > win]
-            if not cuts:
-                continue
-            # Everything from each cut onward becomes a new identity.
-            boundaries = []
-            for c in cuts:
-                new_cid = self._next_free_id()
-                boundaries.append((hist[c][0], new_cid))
-                splits += 1
-            self.id_splits[cid] = boundaries
+            splits += self._apply_track_cuts(cid, hist, cuts)
+        return splits
 
-            # Rewrite this id's own state so stats and the map see the split.
-            segs, start = [], 0
-            for c in cuts + [len(hist)]:
-                segs.append(hist[start:c])
-                start = c
-            ids = [cid] + [b[1] for b in boundaries]
-            for seg_id, seg in zip(ids, segs):
-                if not seg:
+    def split_inefficient_tracks(self, fps: float):
+        """Cut slow identity welds that never teleport in one hop.
+
+        Speed gating misses tracks like mot_sota_v3 id 367 (path/net ≈ 777):
+        the id walks at human pace but zigzags between two players. Over a
+        rolling window, cumulative path ≫ chord length means the track is
+        visiting two bodies. Cut at the sample farthest from the chord — the
+        natural hand-off point between the two players.
+        """
+        splits = 0
+        win = max(2, int(EFFICIENCY_WINDOW_SECONDS * fps))
+        for cid in list(self.id_history.keys()):
+            hist = sorted(self.id_history[cid])
+            if len(hist) < win + 2:
+                continue
+            frames = np.array([h[0] for h in hist], dtype=float)
+            pos = np.array([[h[1], h[2]] for h in hist], dtype=float)
+            # Cumulative path along the polyline.
+            steps = np.zeros(len(pos), dtype=float)
+            for i in range(1, len(pos)):
+                steps[i] = steps[i - 1] + float(np.hypot(
+                    pos[i][0] - pos[i - 1][0], pos[i][1] - pos[i - 1][1]))
+
+            cuts = []
+            i = win
+            while i < len(hist):
+                # Find earliest j whose frame span ≈ window.
+                target = frames[i] - win
+                j = int(np.searchsorted(frames, target, side='left'))
+                j = min(max(j, 0), i - 2)
+                if frames[i] - frames[j] < win * 0.5:
+                    i += 1
                     continue
-                self.id_history[seg_id] = seg
-                self.id_frame_count[seg_id] = len(seg)
-                self.id_first_pos[seg_id] = (seg[0][1], seg[0][2])
-                self.id_last_pos[seg_id] = (seg[-1][1], seg[-1][2])
-                if seg_id != cid:
-                    # Class votes cannot be split by time, so copy the parent's
-                    # majority rather than losing the class entirely.
-                    self.id_class_votes[seg_id][self.dominant_class(cid) or
-                                                PLAYER_CLASS_ID] = len(seg)
-                    self.id_crops[seg_id] = self.id_crops.get(cid, [])[:]
-                path = 0.0
-                for a, b in zip(seg[:-1], seg[1:]):
-                    path += float(np.hypot(b[1] - a[1], b[2] - a[2]))
-                self.id_path_px[seg_id] = path
+                path = float(steps[i] - steps[j])
+                net = float(np.hypot(pos[i][0] - pos[j][0],
+                                     pos[i][1] - pos[j][1]))
+                if (path >= MIN_EFFICIENCY_PATH_PX and
+                        path / max(net, 1.0) > MAX_PATH_NET_RATIO):
+                    # Farthest point from the chord j→i is the weld hand-off.
+                    chord = pos[i] - pos[j]
+                    chord_len = float(np.linalg.norm(chord)) + 1e-6
+                    unit = chord / chord_len
+                    best_k, best_d = j + 1, -1.0
+                    for k in range(j + 1, i):
+                        rel = pos[k] - pos[j]
+                        proj = float(rel @ unit)
+                        proj = min(max(proj, 0.0), chord_len)
+                        perp = float(np.linalg.norm(rel - proj * unit))
+                        if perp > best_d:
+                            best_d, best_k = perp, k
+                    # Require a real lateral excursion, not jitter on a line.
+                    if best_d >= 25.0 and best_k not in cuts:
+                        cuts.append(best_k)
+                        # Skip ahead past this window so one weld ≠ N cuts.
+                        i = best_k + win
+                        continue
+                i += max(1, win // 3)
+
+            # De-dupe / order, then apply.
+            cuts = sorted(set(cuts))
+            cuts = [c for k, c in enumerate(cuts)
+                    if k == 0 or c - cuts[k - 1] > win // 2]
+            n = self._apply_track_cuts(cid, hist, cuts)
+            splits += n
         return splits
 
     def merge_stitched(self, fps: float):
@@ -1414,7 +1513,7 @@ class PlayerReIDTracker:
             if len(hist) < 2:
                 continue
             frames = [int(h[0]) for h in hist]
-            xy = np.array([[h[1], h[2]] for h in hist], dtype=np.float32)
+            xy = np.array([[h[1], h[2]] for h in hist], dtype=float)
             # Split internal gaps: a canonical id may already span a re-id
             # jump, and this stage should judge on its own evidence.
             breaks = [0] + [i for i in range(1, len(frames))
@@ -1430,7 +1529,8 @@ class PlayerReIDTracker:
         if len(tracklets) < 2:
             return 0, 0
 
-        identities, links = stitch.stitch_global(tracklets, fps)
+        identities, links = stitch.stitch_global(
+            tracklets, fps, keep_thin=STITCH_KEEP_THIN)
 
         # Each chain collapses onto its lowest id, which keeps numbers stable
         # and small rather than renaming everyone.
@@ -1443,8 +1543,11 @@ class PlayerReIDTracker:
             for cid in ids:
                 if cid != keep:
                     remap[cid] = keep
+        n_thin = sum(1 for l in links if l['thin'])
+        n_applied = sum(1 for l in links
+                        if STITCH_KEEP_THIN or not l['thin'])
         if not remap:
-            return len(links), sum(1 for l in links if l['thin'])
+            return n_applied, n_thin
 
         for src, dst in remap.items():
             self.id_frame_count[dst] += self.id_frame_count.pop(src, 0)
@@ -1455,6 +1558,10 @@ class PlayerReIDTracker:
                                           self.id_history.pop(src, []))
             self.id_first_pos.pop(src, None)
             self.id_last_pos.pop(src, None)
+            if src in self.id_team and dst not in self.id_team:
+                self.id_team[dst] = self.id_team.pop(src)
+            else:
+                self.id_team.pop(src, None)
         # Endpoints have to come from the merged history, not from whichever
         # fragment happened to be written last, or net displacement is wrong.
         for dst in set(remap.values()):
@@ -1462,10 +1569,15 @@ class PlayerReIDTracker:
             if hist:
                 self.id_first_pos[dst] = (hist[0][1], hist[0][2])
                 self.id_last_pos[dst] = (hist[-1][1], hist[-1][2])
+                # Recompute path after merge so efficiency stats stay honest.
+                path = 0.0
+                for a, b in zip(hist[:-1], hist[1:]):
+                    path += float(np.hypot(b[1] - a[1], b[2] - a[2]))
+                self.id_path_px[dst] = path
         for raw, cid in list(self.id_map.items()):
             if cid in remap:
                 self.id_map[raw] = remap[cid]
-        return len(links), sum(1 for l in links if l['thin'])
+        return n_applied, n_thin
 
     def valid_ids(self) -> set:
         valid = set()
@@ -1683,14 +1795,24 @@ def run_player_tracking(
             print(f"\nPhysics check: {n_splits} track(s) cut where motion "
                   f"exceeded {MAX_BODY_HEIGHTS_PER_SEC} body-heights/sec "
                   f"— an id had been handed between two players")
+        n_eff = tracker1.split_inefficient_tracks(fps)
+        if n_eff:
+            print(f"Efficiency check: {n_eff} track(s) cut where path/net "
+                  f"exceeded {MAX_PATH_NET_RATIO} over "
+                  f"{EFFICIENCY_WINDOW_SECONDS:.1f}s — slow identity weld")
     if STITCH:
         n_links, n_thin = tracker1.merge_stitched(fps)
-        print(f"\nStitching: {n_links} links ({n_thin} thin), "
+        dropped = n_thin if not STITCH_KEEP_THIN else 0
+        print(f"\nStitching: {n_links} links applied "
+              f"({n_thin} thin{' — DROPPED' if dropped else ' kept'}), "
               f"{raw_id_count} -> {len(tracker1.id_frame_count)} identities")
-        if n_thin:
+        if n_thin and STITCH_KEEP_THIN:
             print(f"  {n_thin} links had a close runner-up. Thin links measured "
                   f"29% correct against 93% for confident ones — check these "
                   f"ids first when validating.")
+        elif dropped:
+            print(f"  Declined {dropped} thin link(s) (STITCH_KEEP_THIN=False). "
+                  f"Use --keep_thin_stitch to apply them for audit.")
 
     good_ids = tracker1.valid_ids()
     all_ids  = set(tracker1.id_frame_count.keys())
@@ -1699,6 +1821,9 @@ def run_player_tracking(
     print(f"  Total canonical IDs : {len(all_ids)}")
     print(f"  Passed filters      : {len(good_ids)}")
     print(f"  Removed as noise    : {len(all_ids) - len(good_ids)}")
+    collision_ids = sorted(i for i in all_ids if i >= 100000)
+    if collision_ids:
+        print(f"  Collision-split IDs : {len(collision_ids)} (≥100000)")
     print(f"  Valid IDs           : {sorted(good_ids)}")
 
     if focus_id is not None and focus_id not in good_ids:
@@ -1708,13 +1833,16 @@ def run_player_tracking(
     # Save ID list JSON for manual validation
     id_stats = []
     for cid in sorted(all_ids):
+        net = float(tracker1.net_displacement(cid))
+        path = float(tracker1.id_path_px[cid])
         id_stats.append({
             "canonical_id":        int(cid),
             "frames_seen":         int(tracker1.id_frame_count[cid]),
-            "path_length_px":      round(float(tracker1.id_path_px[cid]), 1),
-            "speed_px_per_sec":    round(float(tracker1.id_path_px[cid]) /
+            "path_length_px":      round(path, 1),
+            "speed_px_per_sec":    round(path /
                                          max(tracker1.id_frame_count[cid] / fps, 1e-6), 1),
-            "net_displacement_px": round(tracker1.net_displacement(cid), 1),
+            "net_displacement_px": round(net, 1),
+            "path_net_ratio":      round(tracker1.path_net_ratio(cid), 2),
             "class":               {BALL_CLASS_ID: 'ball',
                                     GOALKEEPER_CLASS_ID: 'goalkeeper',
                                     PLAYER_CLASS_ID: 'player',
@@ -1722,7 +1850,7 @@ def run_player_tracking(
                                         tracker1.dominant_class(cid), 'unknown'),
             "passed_filter":       bool(cid in good_ids),
             "player_name":         None,
-            "team":                None,
+            "team":                tracker1.id_team.get(cid),
         })
     id_path = output_path_for(source_video_path, 'player_id_list')
     with open(id_path, 'w') as f:
@@ -1801,13 +1929,21 @@ def run_player_tracking(
     split_map = dict(getattr(tracker1, 'id_splits', {}) or {})
 
     def apply_splits(cid, frame_no):
-        bounds = split_map.get(cid)
-        if not bounds:
-            return cid
+        # Chain: efficiency may cut a fragment that speed already split off.
         out = cid
-        for from_frame, new_cid in bounds:
-            if frame_no >= from_frame:
-                out = new_cid
+        seen = set()
+        while out not in seen:
+            seen.add(out)
+            bounds = split_map.get(out)
+            if not bounds:
+                break
+            nxt = out
+            for from_frame, new_cid in bounds:
+                if frame_no >= from_frame:
+                    nxt = new_cid
+            if nxt == out:
+                break
+            out = nxt
         return out
 
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
@@ -2292,6 +2428,9 @@ if __name__ == '__main__':
     parser.add_argument('--no_stitch', action='store_true',
                         help='Skip offline tracklet stitching after pass 1, '
                              'showing the online tracker output unmodified.')
+    parser.add_argument('--keep_thin_stitch', action='store_true',
+                        help='Apply thin-margin stitch links (default: drop them; '
+                             'thin links measured ~29%% correct).')
     parser.add_argument('--track_dump', action='store_true',
         help='Save every id\'s per-frame position, for offline tracklet '
              'stitching with stitch_tracks.py.')
@@ -2336,6 +2475,8 @@ if __name__ == '__main__':
         MINIMAP_CORNER = args.minimap_corner
     if args.no_stitch:
         STITCH = False
+    if args.keep_thin_stitch:
+        STITCH_KEEP_THIN = True
     if args.track_dump:
         TRACK_DUMP = True
     if args.include_referees:
