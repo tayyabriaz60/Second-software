@@ -969,12 +969,13 @@ def render_radar(
 class PlayerReIDTracker:
 
     def __init__(self, frame_width: int, frame_height: int, fps: float = 30.0,
-                 device: str = 'cpu'):
+                 device: str = 'cpu', use_appearance: bool = True):
         self.fps           = fps or 30.0
         self.window_frames = max(1, int(REID_WINDOW_SECONDS * self.fps))
         self.bt_lost_frames = max(1, int(BYTE_TRACK_LOST_SECONDS * self.fps))
         self.min_frames    = max(1, int(MIN_SECONDS_TO_KEEP * self.fps))
         self.bridge_frames = max(2, int(BRIDGE_MAX_FRAMES))
+        self.use_appearance = use_appearance
         self.team_sep: float = 0.0
         self.team_vote_frac: dict = {}   # cid -> vote majority fraction
         # frame_rate must match the video: without it ByteTrack assumes 30fps
@@ -1355,7 +1356,10 @@ class PlayerReIDTracker:
             return sv.Detections.empty()
 
         embeddings = {}
-        need_appearance = APPEARANCE_HARD_GATE or APPEARANCE_WEIGHT > 0
+        need_appearance = (
+            self.use_appearance
+            and (APPEARANCE_HARD_GATE or APPEARANCE_WEIGHT > 0)
+        )
         if frame is not None and need_appearance:
             wanted, crops = [], []
             for i, raw_id in enumerate(detections.tracker_id):
@@ -2275,8 +2279,15 @@ def run_player_tracking(
 
     # ---- PASS 2: render output video (video read again from disk) ----
     print("Pass 2: rendering output video...")
-    tracker2 = PlayerReIDTracker(video_info.width, video_info.height, fps, device)
-    # Seed the id_map so canonical IDs match pass 1
+    # Pass 2 only draws identities already decided in pass 1. Skip SigLIP /
+    # appearance ReID here — it re-downloads the vision tower, spams
+    # "Embedding extraction: 1it", and slows render 2–5x for no ID gain.
+    tracker2 = PlayerReIDTracker(
+        video_info.width, video_info.height, fps, device,
+        use_appearance=False)
+    # Seed the id_map so canonical IDs match pass 1 (ByteTrack is deterministic
+    # on the same detections). Do NOT seed last_seen — those frame indices are
+    # from the end of pass 1 and would break online ReID timing in pass 2.
     tracker2.id_map = tracker1.id_map.copy()
 
     FOCUS_COLOUR = (0, 255, 128)
