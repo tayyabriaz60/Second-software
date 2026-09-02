@@ -5,7 +5,7 @@ import os
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 from enum import Enum
-from typing import Iterator, List
+from typing import Iterator, List, Optional
 
 import cv2
 import numpy as np
@@ -98,7 +98,9 @@ CONFIG = SoccerPitchConfiguration()
 # Raised 1.5→3.0s for production panoramic matches: most ID-explosion fragments
 # die well under 3s, while real players (and post-stitch identities) survive.
 # Transient shadow / touchline artifacts must not keep a "valid" identity.
-MIN_SECONDS_TO_KEEP = 8.0
+# Raised for production, but short --max_frames calibration runs must not
+# empty the roster: PlayerReIDTracker caps this against clip length.
+MIN_SECONDS_TO_KEEP = 3.0
 # Movement floor as a RATE, not a total. A fixed pixel count silently gets
 # stricter the shorter the clip: 500px is trivial over 143s but a lot over 30s,
 # so on a 30s render it filtered out ten players who were tracked the whole
@@ -347,11 +349,12 @@ MOVE_SAMPLE_EVERY = 15     # frames between position samples
 MOVE_MIN_STEP_PX  = 5      # ignore smaller steps — that's box jitter, not travel
 
 # Pitch boundary as % of frame — used for the sides and the near edge, and as
-# the fallback for the far edge when the touchline curve can't be fitted.
+# the fallback for the far edge when the touchline curve / motion polygon
+# cannot be trusted (dry pitches with 0 keypoints).
 PITCH_LEFT_PCT   = 5
 PITCH_RIGHT_PCT  = 95
-PITCH_TOP_PCT    = 10
-PITCH_BOTTOM_PCT = 90
+PITCH_TOP_PCT    = 8
+PITCH_BOTTOM_PCT = 95
 
 # Far-touchline filter. On panoramic footage the pitch bows, so a straight
 # percentage cut-off leaves the crowd standing behind the far touchline inside
@@ -366,6 +369,17 @@ TOUCHLINE_MAX_RESID  = 25   # px — reject the fit if the landmarks disagree mo
 # clip that pans. A moving camera can still produce a low-residual fit, so
 # checking the residual alone is not enough to catch it.
 TOUCHLINE_MAX_MOTION_PX = 60
+
+# Motion-polygon safety: if a built polygon keeps fewer than this fraction of
+# raw player feet (or covers too little of the frame), discard it and use the
+# %-bounds. A bad motion polygon was wiping every detection on dry pitches
+# where keypoints fail and players themselves look "static" across samples.
+PITCH_POLYGON_MIN_AREA_FRAC = 0.38
+PITCH_POLYGON_MIN_KEEP_FRAC = 0.50
+PITCH_POLYGON_MAX_FAR_Y_FRAC = 0.42   # far edge must stay in the top ~42%
+# After this many frames where the polygon would wipe all dets but %-bounds
+# would keep some, disable the polygon for the rest of the run.
+PITCH_POLYGON_FAIL_DISABLE = 20
 
 # Nested-box suppression. NMS drops a box when it overlaps another by IoU, but
 # a small box sitting inside a large one has LOW IoU precisely because their
@@ -507,10 +521,38 @@ FAR_TOUCHLINE = None
 # Built by build_pitch_polygon(), or loaded from --pitch_polygon.
 PITCH_POLYGON = None
 PITCH_POLYGON_PATH = None
+# Frames where polygon wiped all dets while %-bounds would have kept some.
+_pitch_polygon_fail_frames = 0
+
+
+def _percent_bounds_mask(detections: sv.Detections, frame_w: int,
+                         frame_h: int) -> np.ndarray:
+    """Loose side/top/bottom percentage gate — last-resort keep filter."""
+    xyxy = detections.xyxy
+    cx_pct = ((xyxy[:, 0] + xyxy[:, 2]) / 2) / frame_w * 100
+    cy_pct = ((xyxy[:, 1] + xyxy[:, 3]) / 2) / frame_h * 100
+    return ((cx_pct >= PITCH_LEFT_PCT) & (cx_pct <= PITCH_RIGHT_PCT) &
+            (cy_pct >= PITCH_TOP_PCT) & (cy_pct <= PITCH_BOTTOM_PCT))
+
+
+def _detect_raw_for_polygon(frame):
+    """Detector call used while building/validating the pitch polygon."""
+    if DETECTOR == 'rfdetr':
+        import rfdetr_onnx
+        return rfdetr_onnx.detect(frame, conf=INFERENCE_CONF)
+    # Prefer CUDA/CPU over hard-coded 'mps' (breaks on RunPod Linux).
+    device = 'cuda' if os.environ.get('CUDA_VISIBLE_DEVICES', '') != '' else 'cpu'
+    try:
+        _m = load_player_model(device)
+    except Exception:
+        _m = load_player_model('cpu')
+    return sv.Detections.from_ultralytics(
+        _m(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF,
+           agnostic_nms=True, verbose=False)[0])
 
 
 def build_pitch_polygon_from_motion(source_video_path, frame_w, frame_h,
-                                    n_samples=40, cell=64, static_frac=0.60):
+                                    n_samples=40, cell=64, static_frac=0.75):
     """Outline the pitch WITHOUT pitch markings, using motion.
 
     The landmark route below needs `football-pitch-detection.pt` to find
@@ -524,41 +566,20 @@ def build_pitch_polygon_from_motion(source_video_path, frame_w, frame_h,
     door. A cell occupied occasionally is pitch that players pass through. The
     far touchline sits just below the lowest static cell in each column.
 
-    Columns with no static detection are filled from their neighbours: crowd
-    lines a touchline continuously, so an empty column means detection missed
-    them there, not that the crowd stopped. Without that fill the boundary
-    drops to the frame top in gaps and lets the car park back in.
-
-    Measured on 14_09 against ~24 people actually on the pitch:
-        percentage bounds       31 detections/frame
-        this method             24.2
-
-    The near touchline is at or below the frame bottom on an elevated camera,
-    so the polygon closes along the bottom edge.
+    static_frac defaults to 0.75 (was 0.60): at 0.60, standing/jogging players
+    on a short sample window were labelled "crowd", the far edge dropped into
+    midfield, and clean_detections wiped every valid player → Valid IDs [].
     """
     import collections
     info = sv.VideoInfo.from_video_path(source_video_path)
     fps = info.fps or 30.0
     step = max(1, int(3 * fps))
 
-    # Detect directly rather than through the pipeline's own helper: this runs
-    # BEFORE any polygon exists, so it must not apply the filter it is trying
-    # to build. Nested-box suppression is still wanted — duplicate boxes on one
-    # spectator would look like a very static cell.
-    if DETECTOR == 'rfdetr':
-        import rfdetr_onnx
-        detect = lambda f: rfdetr_onnx.detect(f, conf=INFERENCE_CONF)
-    else:
-        _m = load_player_model('mps')
-        detect = lambda f: sv.Detections.from_ultralytics(
-            _m(f, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF,
-               agnostic_nms=True, verbose=False)[0])
-
     occ = collections.Counter()
     taken = n = 0
     for frame in video_frames(source_video_path, start_frame=START_FRAME):
         if n % step == 0:
-            det = suppress_contained_boxes(detect(frame))
+            det = suppress_contained_boxes(_detect_raw_for_polygon(frame))
             if len(det) and det.class_id is not None:
                 det = det[np.isin(det.class_id, [GOALKEEPER_CLASS_ID,
                                                  PLAYER_CLASS_ID,
@@ -576,11 +597,15 @@ def build_pitch_polygon_from_motion(source_video_path, frame_w, frame_h,
     n_cols = frame_w // cell + 1
     raw = {}
     for xb in range(n_cols):
+        # Only cells in the TOP half of the frame can be "crowd" for an
+        # elevated camera — treating midfield players as static is the
+        # failure mode that emptied Valid IDs.
+        y_limit = (frame_h // 2) // cell
         static = [yb for (x, yb), c in occ.items()
-                  if x == xb and c >= static_frac * taken]
+                  if x == xb and yb <= y_limit and c >= static_frac * taken]
         raw[xb] = (max(static) + 1) * cell if static else None
     if all(v is None for v in raw.values()):
-        print("  Pitch polygon: no static band found — no crowd to exclude")
+        print("  Pitch polygon: no static band found — using %-bounds fallback")
         return None
 
     filled = []
@@ -591,17 +616,74 @@ def build_pitch_polygon_from_motion(source_video_path, frame_w, frame_h,
         near = [raw[x] for x in range(max(0, xb - 6), min(n_cols, xb + 7))
                 if raw[x] is not None]
         filled.append(max(near) if near else 0)
-    # Local max so the boundary never dips below a neighbouring column's crowd.
     smooth = [int(max(filled[max(0, i - 2):i + 3])) for i in range(n_cols)]
 
-    cap = int(frame_h * 0.36)          # never cut more than the top third away
-    pts = [[xb * cell, min(smooth[xb], cap)] for xb in range(0, n_cols, 3)]
+    # Never cut more than the top ~42% away — deeper cuts remove real players.
+    cap = int(frame_h * PITCH_POLYGON_MAX_FAR_Y_FRAC)
+    smooth = [min(y, cap) for y in smooth]
+    pts = [[xb * cell, smooth[xb]] for xb in range(0, n_cols, 3)]
     poly = np.array([[0, pts[0][1]]] + pts +
                     [[frame_w, smooth[-1]], [frame_w, frame_h], [0, frame_h]],
                     dtype=np.int32)
     print(f"  Pitch polygon (motion): {len(poly)} points, "
           f"far edge y={min(p[1] for p in pts)}..{max(p[1] for p in pts)}, "
           f"{cv2.contourArea(poly) / (frame_w * frame_h):.0%} of frame")
+    return poly
+
+
+def validate_pitch_polygon(poly, source_video_path, frame_w, frame_h,
+                           n_check: int = 10) -> Optional[np.ndarray]:
+    """Reject a motion/keypoint polygon that would wipe player detections."""
+    if poly is None or len(poly) < 3:
+        return None
+    area_frac = float(cv2.contourArea(poly)) / max(frame_w * frame_h, 1)
+    if area_frac < PITCH_POLYGON_MIN_AREA_FRAC:
+        print(f"  Pitch polygon REJECTED: area {area_frac:.0%} of frame "
+              f"< {PITCH_POLYGON_MIN_AREA_FRAC:.0%} — using %-bounds")
+        return None
+    far_ys = [int(p[1]) for p in poly[:-2]]  # exclude bottom closers
+    if far_ys and max(far_ys) > int(frame_h * PITCH_POLYGON_MAX_FAR_Y_FRAC) + 5:
+        print(f"  Pitch polygon REJECTED: far edge y={max(far_ys)} too deep "
+              f"(>{PITCH_POLYGON_MAX_FAR_Y_FRAC:.0%} of frame) — using %-bounds")
+        return None
+
+    info = sv.VideoInfo.from_video_path(source_video_path)
+    fps = info.fps or 30.0
+    step = max(1, int(2 * fps))
+    raw_n = keep_n = checked = 0
+    for frame in video_frames(source_video_path, start_frame=START_FRAME):
+        if checked % step != 0 and checked > 0:
+            checked += 1
+            continue
+        det = suppress_contained_boxes(_detect_raw_for_polygon(frame))
+        checked += 1
+        if len(det) == 0:
+            if checked >= n_check * step:
+                break
+            continue
+        if det.class_id is not None:
+            det = det[np.isin(det.class_id,
+                              [PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID,
+                               REFEREE_CLASS_ID])]
+        if len(det) == 0:
+            if checked >= n_check * step:
+                break
+            continue
+        feet = det.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+        raw_n += len(det)
+        keep_n += sum(
+            1 for x, y in feet
+            if cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0)
+        if raw_n >= 40 or checked >= n_check * step:
+            break
+    if raw_n >= 12:
+        frac = keep_n / raw_n
+        print(f"  Pitch polygon validation: kept {keep_n}/{raw_n} "
+              f"player feet ({frac:.0%})")
+        if frac < PITCH_POLYGON_MIN_KEEP_FRAC:
+            print(f"  Pitch polygon REJECTED: keep rate {frac:.0%} "
+                  f"< {PITCH_POLYGON_MIN_KEEP_FRAC:.0%} — using %-bounds")
+            return None
     return poly
 
 
@@ -791,7 +873,12 @@ def clean_detections(
     frame_w: int,
     frame_h: int
 ) -> sv.Detections:
-    """Remove nested duplicate boxes, then anything off the pitch."""
+    """Remove nested duplicate boxes, then anything off the pitch.
+
+    Safety: a bad motion polygon must NEVER wipe a frame that the loose
+    %-bounds would have kept — that was emptying Valid IDs on dry pitches.
+    """
+    global PITCH_POLYGON, _pitch_polygon_fail_frames
     if len(detections) == 0:
         return detections
 
@@ -799,27 +886,37 @@ def clean_detections(
     if len(detections) == 0:
         return detections
 
-    xyxy   = detections.xyxy
-    cx_pct = ((xyxy[:, 0] + xyxy[:, 2]) / 2) / frame_w * 100
-    cy_pct = ((xyxy[:, 1] + xyxy[:, 3]) / 2) / frame_h * 100
-
-    # Sides and near edge always apply.
-    mask = ((cx_pct >= PITCH_LEFT_PCT) & (cx_pct <= PITCH_RIGHT_PCT) &
-            (cy_pct <= PITCH_BOTTOM_PCT))
-
-    # Feet, not box centre: "is this person standing on the grass" is a
-    # question about the ground plane.
+    pct_mask = _percent_bounds_mask(detections, frame_w, frame_h)
     feet = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+
     if PITCH_POLYGON is not None:
-        # The polygon already bounds left/right by the goal lines, which is
-        # stricter and more accurate than the percentage side-bounds.
-        mask = np.array([
+        poly_mask = np.array([
             cv2.pointPolygonTest(PITCH_POLYGON, (float(x), float(y)), False) >= 0
             for x, y in feet])
+        if poly_mask.any():
+            mask = poly_mask
+        elif pct_mask.any():
+            # Polygon would drop everyone; %-bounds still see players.
+            _pitch_polygon_fail_frames += 1
+            if _pitch_polygon_fail_frames == 1 or _pitch_polygon_fail_frames % 50 == 0:
+                print(f"  Pitch filter: polygon wiped frame "
+                      f"({_pitch_polygon_fail_frames}x) — using %-bounds")
+            if _pitch_polygon_fail_frames >= PITCH_POLYGON_FAIL_DISABLE:
+                print(f"  Pitch polygon DISABLED after "
+                      f"{_pitch_polygon_fail_frames} wipe-frames — "
+                      f"%-bounds for the rest of the run")
+                PITCH_POLYGON = None
+            mask = pct_mask
+        else:
+            mask = poly_mask
     elif FAR_TOUCHLINE is not None:
-        mask &= feet[:, 1] > FAR_TOUCHLINE(feet[:, 0]) + TOUCHLINE_BUFFER_PX
+        mask = pct_mask & (
+            feet[:, 1] > FAR_TOUCHLINE(feet[:, 0]) + TOUCHLINE_BUFFER_PX)
+        # If touchline curve alone wipes the frame, keep %-bounds.
+        if not mask.any() and pct_mask.any():
+            mask = pct_mask
     else:
-        mask &= cy_pct >= PITCH_TOP_PCT
+        mask = pct_mask
 
     if not mask.any():
         return sv.Detections.empty()
@@ -1815,54 +1912,54 @@ class PlayerReIDTracker:
         return splits
 
     def valid_ids(self) -> set:
-        """Client roster filter: clean long tracks in the 24–40 band."""
-        candidates = []
-        for cid, count in self.id_frame_count.items():
-            if count < self.min_frames:
-                continue
-            if EXCLUDE_COLLISION_IDS_FROM_PASSED and cid >= 100000:
-                continue
-            if self.dominant_class(cid) != GOALKEEPER_CLASS_ID:
-                seconds = count / self.fps
-                speed = self.id_path_px[cid] / seconds if seconds > 0 else 0.0
-                if (speed < MIN_SPEED_PX_PER_SEC and
-                        self.net_displacement(cid) < MIN_NET_DISPLACEMENT_PX):
-                    continue
-            pn = self.path_net_ratio(cid)
-            if pn > MAX_PASSED_PATH_NET:
-                continue
-            candidates.append((cid, count, pn))
+        """Client roster filter: clean long tracks in the 24–40 band.
 
-        # Prefer long, efficient tracks.
-        candidates.sort(key=lambda t: (-t[1], t[2]))
-        if len(candidates) > TARGET_PASSED_MAX:
-            candidates = candidates[:TARGET_PASSED_MAX]
-        # If under-filled, relax path_net once to approach TARGET_PASSED_MIN.
-        if len(candidates) < TARGET_PASSED_MIN:
-            extra = []
-            taken = {c[0] for c in candidates}
+        Never returns empty when tracks exist — progressive relaxation so a
+        harsh path_net / duration gate cannot yield Valid IDs: [].
+        """
+        def gather(max_path_net, min_frames, allow_collision=False):
+            out = []
             for cid, count in self.id_frame_count.items():
-                if cid in taken or count < self.min_frames:
+                if count < min_frames:
                     continue
-                if EXCLUDE_COLLISION_IDS_FROM_PASSED and cid >= 100000:
-                    continue
-                pn = self.path_net_ratio(cid)
-                if pn > MAX_PASSED_PATH_NET * 2.0:
+                if (EXCLUDE_COLLISION_IDS_FROM_PASSED and not allow_collision
+                        and cid >= 100000):
                     continue
                 if self.dominant_class(cid) != GOALKEEPER_CLASS_ID:
                     seconds = count / self.fps
-                    speed = self.id_path_px[cid] / seconds if seconds > 0 else 0.0
+                    speed = (self.id_path_px[cid] / seconds
+                             if seconds > 0 else 0.0)
                     if (speed < MIN_SPEED_PX_PER_SEC and
                             self.net_displacement(cid) < MIN_NET_DISPLACEMENT_PX):
                         continue
-                extra.append((cid, count, pn))
-            extra.sort(key=lambda t: (-t[1], t[2]))
-            for row in extra:
-                if len(candidates) >= TARGET_PASSED_MIN:
-                    break
-                candidates.append(row)
-            if len(candidates) > TARGET_PASSED_MAX:
-                candidates = candidates[:TARGET_PASSED_MAX]
+                pn = self.path_net_ratio(cid)
+                if pn > max_path_net:
+                    continue
+                out.append((cid, count, pn))
+            out.sort(key=lambda t: (-t[1], t[2]))
+            return out
+
+        min_f = self.min_frames
+        candidates = gather(MAX_PASSED_PATH_NET, min_f)
+        if len(candidates) < TARGET_PASSED_MIN:
+            candidates = gather(MAX_PASSED_PATH_NET * 2.0, min_f)
+        if len(candidates) < TARGET_PASSED_MIN:
+            candidates = gather(MAX_PASSED_PATH_NET * 4.0,
+                                max(1, min_f // 2))
+        # Last resort: any track that lived at least ~1s — never empty the list
+        # when the tracker saw people. Empty Valid IDs makes pass-2 render blank.
+        if not candidates and self.id_frame_count:
+            floor = max(1, int(1.0 * self.fps))
+            candidates = [
+                (cid, count, self.path_net_ratio(cid))
+                for cid, count in self.id_frame_count.items()
+                if count >= floor
+            ]
+            candidates.sort(key=lambda t: (-t[1], t[2]))
+            print(f"  valid_ids: relaxed to {len(candidates)} tracks "
+                  f"(≥1s) after stricter filters kept 0")
+        if len(candidates) > TARGET_PASSED_MAX:
+            candidates = candidates[:TARGET_PASSED_MAX]
         return {c[0] for c in candidates}
 
 
@@ -2033,6 +2130,13 @@ def run_player_tracking(
     # ---- PASS 1: build lifetime stats (no frames stored in memory) ----
     print("Pass 1: building tracker lifetime stats...")
     tracker1 = PlayerReIDTracker(video_info.width, video_info.height, fps, device)
+    if max_frames:
+        # Short calibration clips must not demand long continuous tracking.
+        cap = max(1, int(0.20 * max_frames))
+        if tracker1.min_frames > cap:
+            print(f"  min_frames capped {tracker1.min_frames} → {cap} "
+                  f"(20% of --max_frames={max_frames})")
+            tracker1.min_frames = cap
     for frame in tqdm(
         video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME),
         desc='Pass 1'
@@ -2619,6 +2723,8 @@ def main(
         PITCH_POLYGON = np.load(PITCH_POLYGON_PATH).astype(np.int32)
         print(f"  Pitch polygon: loaded {len(PITCH_POLYGON)} points from "
               f"{os.path.basename(PITCH_POLYGON_PATH)}")
+        PITCH_POLYGON = validate_pitch_polygon(
+            PITCH_POLYGON, source_video_path, _vi.width, _vi.height)
     else:
         PITCH_POLYGON = build_pitch_polygon(source_video_path, device,
                                             _vi.width, _vi.height)
@@ -2631,6 +2737,13 @@ def main(
                   "(no pitch markings found)...")
             PITCH_POLYGON = build_pitch_polygon_from_motion(
                 source_video_path, _vi.width, _vi.height)
+        # Reject polygons that would wipe players (dry pitch / short sample).
+        PITCH_POLYGON = validate_pitch_polygon(
+            PITCH_POLYGON, source_video_path, _vi.width, _vi.height)
+        if PITCH_POLYGON is None:
+            print("  Pitch filter: using percentage bounds "
+                  f"({PITCH_LEFT_PCT}-{PITCH_RIGHT_PCT}% x, "
+                  f"{PITCH_TOP_PCT}-{PITCH_BOTTOM_PCT}% y)")
         if PITCH_POLYGON is not None:
             _out = output_path_for(source_video_path, 'pitch_polygon').replace(
                 '.json', '.npy')
