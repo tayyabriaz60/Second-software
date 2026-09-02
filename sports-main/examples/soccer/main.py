@@ -2,6 +2,8 @@ import argparse
 import itertools
 import json
 import os
+import shutil
+import subprocess
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 from enum import Enum
@@ -12,6 +14,101 @@ import numpy as np
 import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
+
+
+class RobustVideoSink:
+    """Write a playable MP4; prefer ffmpeg over OpenCV's fragile mp4v path.
+
+    OpenCV VideoWriter can spam 'Failed to write frame' and exit 'Done' while
+    leaving a file with no moov atom (unopenable). ffmpeg libx264 + faststart
+    finalizes the container properly; we fail loud if the pipe dies.
+    """
+
+    def __init__(self, path: str, video_info: sv.VideoInfo):
+        self.path = path
+        self.fps = float(getattr(video_info, 'fps', 0) or 30.0)
+        w = int(video_info.width)
+        h = int(video_info.height)
+        # libx264 / yuv420p need even dimensions
+        self.width = w - (w % 2)
+        self.height = h - (h % 2)
+        self._proc: Optional[subprocess.Popen] = None
+        self._writer = None
+        self._n = 0
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)) or '.',
+                    exist_ok=True)
+        if shutil.which('ffmpeg'):
+            cmd = [
+                'ffmpeg', '-y', '-loglevel', 'error',
+                '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-s', f'{self.width}x{self.height}',
+                '-r', str(self.fps),
+                '-i', '-',
+                '-an',
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-preset', 'veryfast', '-crf', '23',
+                '-movflags', '+faststart',
+                self.path,
+            ]
+            self._proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            print(f"Video writer: ffmpeg libx264 -> {self.path}")
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self._writer = cv2.VideoWriter(
+                self.path, fourcc, self.fps, (self.width, self.height))
+            if not self._writer.isOpened():
+                raise RuntimeError(f"Could not open VideoWriter for {self.path}")
+            print(f"Video writer: OpenCV mp4v -> {self.path} "
+                  f"(install ffmpeg for safer output)")
+        return self
+
+    def write_frame(self, frame: np.ndarray) -> None:
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height))
+        frame = np.ascontiguousarray(frame)
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write(frame.tobytes())
+            except BrokenPipeError as exc:
+                err = ''
+                if self._proc.stderr:
+                    err = self._proc.stderr.read().decode('utf-8', 'ignore')[-500:]
+                raise RuntimeError(
+                    f"ffmpeg pipe broke after {self._n} frames. "
+                    f"Output is likely corrupt. stderr: {err}"
+                ) from exc
+        else:
+            self._writer.write(frame)
+        self._n += 1
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+            except Exception:
+                pass
+            rc = self._proc.wait()
+            err = ''
+            if self._proc.stderr:
+                err = self._proc.stderr.read().decode('utf-8', 'ignore')[-800:]
+            if exc_type is None and rc != 0:
+                raise RuntimeError(
+                    f"ffmpeg exited {rc} after {self._n} frames — "
+                    f"MP4 likely invalid. {err}"
+                )
+            if exc_type is None:
+                print(f"Wrote {self._n} frames via ffmpeg (ok)")
+        elif self._writer is not None:
+            self._writer.release()
+            if exc_type is None:
+                print(f"Wrote {self._n} frames via OpenCV")
+        return False
 
 from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
 from sports.common.ball import BallAnnotator, BallTracker
@@ -2811,7 +2908,7 @@ def main(
         return
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
-    with sv.VideoSink(target_video_path, video_info) as sink:
+    with RobustVideoSink(target_video_path, video_info) as sink:
         for frame in tqdm(gen, desc='Processing'):
             sink.write_frame(frame)
 
