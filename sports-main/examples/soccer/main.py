@@ -206,10 +206,10 @@ MAX_BODY_HEIGHTS_PER_SEC = 9.0
 # Baseline over which speed is measured. Long enough that detection jitter
 # averages out, short enough that a real teleport still registers.
 SPEED_WINDOW_SECONDS = 0.20
-# Path-efficiency split: catches SLOW identity welds that never teleport in one
-# hop (mot_sota_v3 id 367: path/net ≈ 777 while speed stayed "human"). Over a
-# rolling window, if cumulative path ≫ straight-line net, the track is visiting
-# two players. Cut at the farthest point from the chord.
+# Path-efficiency split: OFF by default after mot_sota_v4 — cutting "inefficient"
+# tracks exploded fragmentation (413→697 IDs) without curing welds. Teleport
+# speed cuts (SPLIT_IMPLAUSIBLE) remain the only online physics scissors.
+SPLIT_INEFFICIENT = False
 EFFICIENCY_WINDOW_SECONDS = 3.0
 MAX_PATH_NET_RATIO = 12.0
 MIN_EFFICIENCY_PATH_PX = 200.0
@@ -222,15 +222,13 @@ TEAM_CROP_STRIDE = 8
 # CONTINUE an existing one. Reduces ID minting without starving association.
 TRACK_ACTIVATION_THRESHOLD = 0.45
 # Matching gate for associating a detection with an existing track; higher is
-# more permissive. Swept 0.80/0.90/0.95/0.99 on the same clip: ids 55->52 and
-# alive>=75% 10->12. RF-DETR's boxes jitter more than the YOLO boxes ByteTrack's
-# 0.80 default was tuned against, so a moving player fell outside the gate.
-# Cap below 0.99: ultra-permissive matching was a contributor to gradual welds.
-TRACK_MATCHING_THRESHOLD = 0.95
+# more permissive. With a SHORT ByteTrack lost buffer (see BYTE_TRACK_LOST_SECONDS),
+# association is IoU-local; 0.90 is the continuity/switch trade-off for RF-DETR jitter.
+TRACK_MATCHING_THRESHOLD = 0.90
 # Require two hits before a brand-new ByteTrack id is emitted. Single-frame
 # RF-DETR flicker (tree shadow, duplicate query) was minting throwaway ids that
 # then survived long enough to look like "real" fragments in the dump.
-TRACK_MIN_CONSECUTIVE_FRAMES = 3
+TRACK_MIN_CONSECUTIVE_FRAMES = 2
 # Bridge detector/occlusion holes of 1..N frames in id_history (linear +
 # constant-velocity coast). 10 frames covers ~0.18–0.33s depending on fps —
 # the regime where papers densify tracklets rather than letting association
@@ -241,8 +239,8 @@ BRIDGE_MAX_FRAMES = 10
 # movers get a modestly wider gate; idle players stay tight (avoids the
 # measured failure mode of a flat growing radius).
 REID_SPRINT_PX_PER_SEC = 210.0
-REID_RADIUS_SPEED_GAIN = 0.20   # was 0.40 — tighter to cut wrong reclaim
-REID_VELOCITY_DECAY = 0.85
+REID_RADIUS_SPEED_GAIN = 0.30
+REID_VELOCITY_DECAY = 0.88
 # Online CIELAB L-gap above which a lost-track candidate is rejected as the
 # wrong team (navy vs sky-blue kits). Below this, colour is ignored online.
 TEAM_LAB_HARD_DELTA = 28.0
@@ -288,14 +286,23 @@ START_FRAME = 0
 # roughly 25 ids x 300k frames of coordinates.
 TRACK_DUMP = False
 
-# Re-identification. These are expressed in seconds because frame counts mean
-# different things on 30fps and 57fps footage — the old fixed 150-frame window
-# was 5s as intended at 30fps but only 2.6s here.
+# ---------------------------------------------------------------------------
+# IDENTITY ARCHITECTURE (mot_sota_v4 post-mortem)
+# ---------------------------------------------------------------------------
+# Two systems were both trying to remember identity for ~10s:
+#   ByteTrack lost_track_buffer == REID_WINDOW  →  BT revives a raw track AFTER
+#   ReID already handed that canonical id to a NEW raw track → same-frame
+#   collision → _next_free_id() → 100xxx swarm (428 of 564 passed IDs in v4).
 #
-# Raised 5s→10s (≡150→300 frames @ 30fps) so mid-pitch dropouts and tree-shadow
-# misses can still reclaim the same canonical id instead of minting duplicates
-# (IDs climbing past 500 on long clips).
-REID_WINDOW_SECONDS = 10.0   # how long a lost track stays re-identifiable
+# Production split of responsibility:
+#   ByteTrack  = short-horizon IoU linker (sub-second coast through flicker)
+#   ReID layer = long-horizon identity memory (who is this after occlusion)
+# When ReID adopts a canonical id onto a new raw track, ALL other raw→cid
+# mappings for that cid are PURGED so a later BT revival cannot double-claim.
+# Collisions never mint 100xxx — loser reverts to its ByteTrack raw id.
+# ---------------------------------------------------------------------------
+BYTE_TRACK_LOST_SECONDS = 0.75   # IoU coast only; NOT long-term identity
+REID_WINDOW_SECONDS = 12.0       # long-horizon reclaim after occlusions
 
 # Spatial gating for re-id, as a fraction of the frame diagonal (~394px here).
 #
@@ -311,16 +318,16 @@ REID_WINDOW_SECONDS = 10.0   # how long a lost track stays re-identifiable
 # The flat radius does over-merge occasionally (one ID landing on two players),
 # which is worth revisiting — but with appearance features, not geometry.
 #
-# Raised 0.12→0.15 then pulled back to 0.12 after mot_sota_v3: wider gates
-# reduced dropouts but fed wrong reclaim + collision-split (100xxx) explosion.
-REID_DISTANCE_FRACTION = 0.12
+# 0.14: slightly wider than v4's 0.12 now that BT no longer double-owns identity;
+# ReID must catch the handoff when BT drops a track at 0.75s.
+REID_DISTANCE_FRACTION = 0.14
 
 # How long a track must have been unseen before another detection may adopt its
 # canonical id. Previously any track not seen THIS frame was fair game, so a
 # momentary detection miss let a second player steal a live id — the "player 2
 # hands his number over" failure. A player genuinely lost is absent for more
 # than a frame or two.
-REID_MIN_LOST_FRAMES = 3
+REID_MIN_LOST_FRAMES = 2
 
 # Appearance tie-breaker for re-id. Among lost tracks already inside the
 # spatial radius, prefer the one that also LOOKS most like this detection,
@@ -899,6 +906,7 @@ class PlayerReIDTracker:
                  device: str = 'cpu'):
         self.fps           = fps or 30.0
         self.window_frames = max(1, int(REID_WINDOW_SECONDS * self.fps))
+        self.bt_lost_frames = max(1, int(BYTE_TRACK_LOST_SECONDS * self.fps))
         self.min_frames    = max(1, int(MIN_SECONDS_TO_KEEP * self.fps))
         self.bridge_frames = max(2, int(BRIDGE_MAX_FRAMES))
         self.team_sep: float = 0.0
@@ -906,9 +914,13 @@ class PlayerReIDTracker:
         # frame_rate must match the video: without it ByteTrack assumes 30fps
         # and its internal time-based buffers drift on 50/55fps screen captures,
         # killing tracks early and minting replacement ids.
+        #
+        # lost_track_buffer is SHORT (BYTE_TRACK_LOST_SECONDS). Long-horizon
+        # identity lives in ReID (window_frames), not in ByteTrack — sharing
+        # one long buffer was the mot_sota_v4 double-claim failure mode.
         bt_kwargs = dict(
             minimum_consecutive_frames=TRACK_MIN_CONSECUTIVE_FRAMES,
-            lost_track_buffer=self.window_frames,
+            lost_track_buffer=self.bt_lost_frames,
             track_activation_threshold=TRACK_ACTIVATION_THRESHOLD,
             minimum_matching_threshold=TRACK_MATCHING_THRESHOLD,
         )
@@ -936,11 +948,14 @@ class PlayerReIDTracker:
         self.id_team:        dict = {}
         self.id_splits:      dict = {}   # cid -> [(from_frame, new_cid), ...]
         self._claimed_this_frame: set = set()
-        self._id_counter = 100000      # fresh ids start well clear of ByteTrack's
+        self._id_counter = 100000      # emergency only — see _assign_canonical
         self.id_embed_frame: dict = {}   # cid -> frame its embedding was taken
         self.device = device
         self._embedder = None
         self.frame_n = 0
+        self.collision_mints = 0        # should stay ~0 after v5 architecture
+        self.reid_adopts = 0
+        self.stale_map_purges = 0
 
     def _next_free_id(self) -> int:
         """A canonical id not yet used by any track."""
@@ -1018,47 +1033,137 @@ class PlayerReIDTracker:
         # before vetoing so shade-induced L drops don't block same-player reclaim.
         return abs(float(det_lab[0]) - float(prev[0])) >= TEAM_LAB_HARD_DELTA
 
-    def _find_lost_match(self, cx, cy, emb=None, det_lab=None, exclude=None):
-        """Find which lost track this detection most likely continues.
+    def _purge_stale_maps(self, cid: int, keep_raw: int) -> int:
+        """Remove every raw→cid mapping except keep_raw.
 
-        Association uses a damped constant-velocity prediction (handles cuts
-        better than pure ballistic coast) inside an adaptive speed-scaled gate,
-        with an optional CIELAB team hard-veto so opposing kits cannot steal an
-        id across a dropout.
+        After ReID hands canonical `cid` to a new ByteTrack track, any older
+        raw id still mapped to `cid` must die — otherwise ByteTrack can revive
+        that raw track and both detections claim the same identity (the
+        double-claim that forced 100xxx minting in v3/v4).
         """
+        purged = 0
+        for r, c in list(self.id_map.items()):
+            if c == cid and r != keep_raw:
+                del self.id_map[r]
+                purged += 1
+        self.stale_map_purges += purged
+        return purged
+
+    def _pred_xy(self, cid, frames_ago: int = None):
+        """Damped constant-velocity prediction of where cid should be now."""
+        lx, ly, last_frame = self.last_seen[cid]
+        if frames_ago is None:
+            frames_ago = max(0, self.frame_n - last_frame)
+        vel = self._exit_velocity(cid)
+        damp = REID_VELOCITY_DECAY ** max(0, frames_ago - 1)
+        return (lx + vel[0] * frames_ago * damp,
+                ly + vel[1] * frames_ago * damp)
+
+    def _motion_residual(self, cid, cx, cy) -> float:
+        """Distance from (cx,cy) to predicted position of cid (px)."""
+        if cid not in self.last_seen:
+            return 1e9
+        px, py = self._pred_xy(cid)
+        return float(np.hypot(cx - px, cy - py))
+
+    def _lost_match_score(self, cid, cx, cy, emb=None, det_lab=None):
+        """Score in [0,1] for reclaiming lost cid, or None if gated out."""
+        if cid not in self.last_seen:
+            return None
+        lx, ly, last_frame = self.last_seen[cid]
+        frames_ago = self.frame_n - last_frame
+        if frames_ago < REID_MIN_LOST_FRAMES or frames_ago > self.window_frames:
+            return None
+        if cid in self._claimed_this_frame:
+            return None
+        if self._lab_team_conflict(cid, det_lab):
+            return None
+        pred_x, pred_y = self._pred_xy(cid, frames_ago)
+        dist = float(np.hypot(cx - pred_x, cy - pred_y))
+        radius = self._adaptive_radius(cid, frames_ago)
+        if dist >= radius:
+            return None
+        score = 1.0 - dist / radius
+        sim = self._similarity(emb, self.id_appearance.get(cid))
+        if sim is not None:
+            score = ((1 - APPEARANCE_WEIGHT) * score
+                     + APPEARANCE_WEIGHT * max(0.0, sim))
+        return score
+
+    def _find_lost_match(self, cx, cy, emb=None, det_lab=None, exclude=None):
+        """Greedy best lost-track reclaim (used for single-det fallback)."""
         exclude = exclude or set()
         best_id, best_score = None, -1.0
-        for cid, (lx, ly, last_frame) in self.last_seen.items():
-            frames_ago = self.frame_n - last_frame
-            # A candidate must be genuinely LOST, not merely unseen this frame.
-            # Claiming a still-active id is how one id ends up on two players at
-            # once — measured on 14_09, 37 of 46 ids held two players at some
-            # point before this guard existed.
-            if frames_ago < REID_MIN_LOST_FRAMES or frames_ago > self.window_frames:
+        for cid in self.last_seen:
+            if cid in exclude:
                 continue
-            if cid in self._claimed_this_frame or cid in exclude:
-                continue
-            if self._lab_team_conflict(cid, det_lab):
-                continue
-            vel = self._exit_velocity(cid)
-            # Decay velocity over the gap so a pre-cut sprint does not overshoot
-            # after a sharp direction change (common failure of plain Kalman CV).
-            damp = REID_VELOCITY_DECAY ** max(0, frames_ago - 1)
-            pred_x = lx + vel[0] * frames_ago * damp
-            pred_y = ly + vel[1] * frames_ago * damp
-            dist = np.sqrt((cx - pred_x) ** 2 + (cy - pred_y) ** 2)
-            radius = self._adaptive_radius(cid, frames_ago)
-            if dist >= radius:
-                continue
-
-            score = 1.0 - dist / radius            # 1 = touching, 0 = at the edge
-            sim = self._similarity(emb, self.id_appearance.get(cid))
-            if sim is not None:
-                score = ((1 - APPEARANCE_WEIGHT) * score
-                         + APPEARANCE_WEIGHT * max(0.0, sim))
-            if score > best_score:
+            score = self._lost_match_score(cid, cx, cy, emb, det_lab)
+            if score is not None and score > best_score:
                 best_score, best_id = score, cid
         return best_id
+
+    def _assign_lost_globally(self, need_match):
+        """Bipartite assign new detections → lost canonical ids.
+
+        need_match: list of dicts with keys i, cx, cy, emb, det_lab, raw_id.
+        Returns dict i -> cid for successful reclaim. Unassigned stay unset
+        so the caller falls back to raw ByteTrack id.
+
+        Global assignment prevents the greedy failure where det A steals lost
+        id 5 and det B (the true continuation) is forced to mint a fragment.
+        """
+        if not need_match:
+            return {}
+        # Candidate pool: currently lost canonicals.
+        lost = []
+        for cid, (_, _, last_frame) in self.last_seen.items():
+            frames_ago = self.frame_n - last_frame
+            if (REID_MIN_LOST_FRAMES <= frames_ago <= self.window_frames
+                    and cid not in self._claimed_this_frame):
+                lost.append(cid)
+        if not lost:
+            return {}
+
+        n_d, n_l = len(need_match), len(lost)
+        # Cost = 1 - score; impossible pairs get a large finite cost so the
+        # rectangular slack (no-match) is preferred via a threshold.
+        BIG = 10.0
+        cost = np.full((n_d, n_l), BIG, dtype=np.float64)
+        for di, det in enumerate(need_match):
+            for lj, cid in enumerate(lost):
+                s = self._lost_match_score(
+                    cid, det['cx'], det['cy'], det['emb'], det['det_lab'])
+                if s is not None:
+                    cost[di, lj] = 1.0 - s
+
+        # Slack columns: decline a reclaim (cost 0.55 ≈ require score ≥ 0.45).
+        NO_MATCH = 0.55
+        slack = np.full((n_d, n_d), BIG, dtype=np.float64)
+        np.fill_diagonal(slack, NO_MATCH)
+        try:
+            from scipy.optimize import linear_sum_assignment
+            rows, cols = linear_sum_assignment(np.hstack([cost, slack]))
+        except Exception:
+            # No scipy: fall back to greedy per-det best.
+            out = {}
+            used = set()
+            for det in need_match:
+                cid = self._find_lost_match(
+                    det['cx'], det['cy'], det['emb'], det['det_lab'],
+                    exclude=used)
+                if cid is not None:
+                    out[det['i']] = cid
+                    used.add(cid)
+            return out
+
+        out = {}
+        for r, c in zip(rows, cols):
+            if c >= n_l:
+                continue
+            if cost[r, c] >= NO_MATCH:
+                continue
+            out[need_match[r]['i']] = lost[c]
+        return out
 
     def interpolate_short_gaps(self) -> int:
         """Fill holes of 2..BRIDGE_MAX_FRAMES in each id_history.
@@ -1122,10 +1227,6 @@ class PlayerReIDTracker:
             self.frame_n += 1
             return sv.Detections.empty()
 
-        # Decide which detections actually need an embedding this frame, and
-        # do them in ONE batch — a per-crop transformer call every frame would
-        # dominate the runtime. Needed for new tracks (to decide who they are)
-        # and periodically for known tracks (to keep the signature current).
         embeddings = {}
         if frame is not None and APPEARANCE_WEIGHT > 0:
             wanted, crops = [], []
@@ -1146,64 +1247,118 @@ class PlayerReIDTracker:
             for i, emb in zip(wanted, self._embed(crops)):
                 embeddings[i] = emb
 
-        self._claimed_this_frame = {
-            self.id_map[int(r)] for r in detections.tracker_id
-            if int(r) in self.id_map
-        }
-        canonical_ids = []
-        used_this_frame: set = set()
-        for i, raw_id in enumerate(detections.tracker_id):
-            raw_id = int(raw_id)
-            cx, cy = self._centre(detections.xyxy[i])
-            emb = embeddings.get(i)
-            det_lab = None
-            x1 = y1 = x2 = y2 = None
-            if frame is not None:
+        # ---- Pass A: gather per-detection evidence ----
+        n = len(detections)
+        raw_ids = [int(r) for r in detections.tracker_id]
+        centres = [self._centre(detections.xyxy[i]) for i in range(n)]
+        det_labs = [None] * n
+        boxes = [None] * n
+        if frame is not None:
+            for i in range(n):
                 x1, y1, x2, y2 = [int(v) for v in detections.xyxy[i]]
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                boxes[i] = (x1, y1, x2, y2)
                 if x2 - x1 >= 8 and y2 - y1 >= 16:
                     try:
                         from team_colour import torso_colour
-                        det_lab = torso_colour(frame[y1:y2, x1:x2])
+                        det_labs[i] = torso_colour(frame[y1:y2, x1:x2])
                     except Exception:
-                        det_lab = None
+                        det_labs[i] = None
 
+        # Known raw tracks claim their canonicals first (short-horizon BT).
+        self._claimed_this_frame = {
+            self.id_map[r] for r in raw_ids if r in self.id_map
+        }
+
+        # New raw tracks: global lost-track assignment (long-horizon ReID).
+        need_match = []
+        for i, raw_id in enumerate(raw_ids):
             if raw_id in self.id_map:
-                cid = self.id_map[raw_id]
-            else:
-                matched = self._find_lost_match(cx, cy, emb, det_lab=det_lab)
-                cid     = matched if matched is not None else raw_id
-                self.id_map[raw_id] = cid
+                continue
+            cx, cy = centres[i]
+            need_match.append({
+                'i': i, 'raw_id': raw_id, 'cx': cx, 'cy': cy,
+                'emb': embeddings.get(i), 'det_lab': det_labs[i],
+            })
+        reid_hits = self._assign_lost_globally(need_match)
 
-            # HARD INVARIANT: one canonical id per detection per frame.
-            #
-            # Re-id hands a lost track's id to a new track, but ByteTrack keeps
-            # its own lost-track buffer and can REVIVE the original later. Both
-            # raw tracks then point at one canonical id and collide on every
-            # frame after. Measured before this guard: 82% of frames contained
-            # at least one doubled id, and every case came from a mapping made
-            # earlier — so preventing it at adoption time is not enough.
-            #
-            # Prefer reclaiming a DIFFERENT lost track over minting a 100xxx
-            # collision-split id (mot_sota_v3: 227 of 317 passed IDs were
-            # ≥100000). Fresh mint is last resort — a split is still safer than
-            # a silent weld, but minting is what drove ID explosion.
-            if cid in used_this_frame:
+        # ---- Pass B: propose a canonical id per detection ----
+        proposed = [None] * n
+        for i, raw_id in enumerate(raw_ids):
+            if raw_id in self.id_map:
+                proposed[i] = self.id_map[raw_id]
+            elif i in reid_hits:
+                proposed[i] = reid_hits[i]
+                self.reid_adopts += 1
+            else:
+                proposed[i] = raw_id  # brand-new identity = ByteTrack raw id
+
+        # ---- Pass C: resolve same-frame collisions WITHOUT minting 100xxx ----
+        #
+        # When two dets propose the same cid, keep the one closer to the
+        # motion-predicted position. Loser: try another lost id, else fall
+        # back to its ByteTrack raw id. Emergency 100xxx mint only if even
+        # the raw id is already taken this frame (should be near-zero).
+        from collections import defaultdict as _dd
+        by_cid = _dd(list)
+        for i, cid in enumerate(proposed):
+            by_cid[cid].append(i)
+
+        used = set()
+        canonical_ids = [None] * n
+        for cid, idxs in by_cid.items():
+            if len(idxs) == 1:
+                i = idxs[0]
+                canonical_ids[i] = cid
+                used.add(cid)
+                continue
+            # Rank claimants by motion residual (lower = better continuation).
+            ranked = sorted(
+                idxs, key=lambda i: self._motion_residual(cid, *centres[i]))
+            winner = ranked[0]
+            canonical_ids[winner] = cid
+            used.add(cid)
+            for i in ranked[1:]:
+                cx, cy = centres[i]
                 alt = self._find_lost_match(
-                    cx, cy, emb, det_lab=det_lab, exclude=used_this_frame)
-                if alt is not None and alt not in used_this_frame:
-                    cid = alt
+                    cx, cy, embeddings.get(i), det_labs[i], exclude=used)
+                if alt is not None and alt not in used:
+                    canonical_ids[i] = alt
+                    used.add(alt)
+                    self.reid_adopts += 1
                 else:
-                    cid = self._next_free_id()
-                self.id_map[raw_id] = cid
-                self._claimed_this_frame.add(cid)
-            used_this_frame.add(cid)
-            canonical_ids.append(cid)
+                    # Revert to ByteTrack identity — NEVER the old 100xxx path.
+                    rid = raw_ids[i]
+                    if rid not in used:
+                        canonical_ids[i] = rid
+                        used.add(rid)
+                    else:
+                        canonical_ids[i] = self._next_free_id()
+                        used.add(canonical_ids[i])
+                        self.collision_mints += 1
+
+        # ---- Pass D: commit id_map + purge stale raw→cid links on ReID ----
+        for i, raw_id in enumerate(raw_ids):
+            cid = canonical_ids[i]
+            prev = self.id_map.get(raw_id)
+            self.id_map[raw_id] = cid
+            # If this raw newly adopted a long-lived canonical (ReID), kill
+            # every other raw still pointing at it.
+            if prev != cid and cid != raw_id:
+                self._purge_stale_maps(cid, keep_raw=raw_id)
+            elif prev is None and cid != raw_id:
+                self._purge_stale_maps(cid, keep_raw=raw_id)
+
+        self._claimed_this_frame = set(canonical_ids)
+
+        # ---- Pass E: update track state ----
+        for i, cid in enumerate(canonical_ids):
+            cx, cy = centres[i]
+            emb = embeddings.get(i)
+            det_lab = det_labs[i]
             self.last_seen[cid] = (cx, cy, self.frame_n)
             if emb is not None:
-                # Blend rather than replace: a single blurred or occluded crop
-                # shouldn't overwrite an otherwise stable signature.
                 prev = self.id_appearance.get(cid)
                 self.id_appearance[cid] = (
                     emb if prev is None else 0.7 * prev + 0.3 * emb)
@@ -1219,25 +1374,14 @@ class PlayerReIDTracker:
             if cid not in self.id_first_pos:
                 self.id_first_pos[cid] = (cx, cy)
             self.id_last_pos[cid] = (cx, cy)
-            # Keep a few crops per id for team colour. Sampled, not every
-            # frame: consecutive crops of one player are near-identical, so
-            # they add memory without adding evidence.
-            if (STITCH and frame is not None and x1 is not None and
+            box = boxes[i]
+            if (STITCH and frame is not None and box is not None and
                     len(self.id_crops[cid]) < TEAM_CROPS_PER_ID and
                     self.frame_n % TEAM_CROP_STRIDE == 0):
+                x1, y1, x2, y2 = box
                 if x2 - x1 >= 8 and y2 - y1 >= 16:
                     self.id_crops[cid].append(frame[y1:y2, x1:x2].copy())
             if TRACK_DUMP or STITCH:
-                # Stitching needs this too, not just --track_dump. Roughly
-                # 80 bytes per detection per frame: ~260MB over a 45-minute
-                # match at 55fps, which is fine, but it is why this stays gated
-                # rather than always on.
-                # Box height comes along because it is our only scale reference.
-                # Pixel speed is meaningless on its own — 40px/frame near the
-                # camera is a jog, the same 40px at the far touchline is
-                # teleportation — but height is proportional to closeness, so
-                # distance/height is a perspective-corrected speed that needs no
-                # homography. See split_implausible_tracks().
                 box_h = float(detections.xyxy[i][3] - detections.xyxy[i][1])
                 self.id_history[cid].append((self.frame_n, float(cx), float(cy),
                                              box_h))
@@ -1795,11 +1939,16 @@ def run_player_tracking(
             print(f"\nPhysics check: {n_splits} track(s) cut where motion "
                   f"exceeded {MAX_BODY_HEIGHTS_PER_SEC} body-heights/sec "
                   f"— an id had been handed between two players")
-        n_eff = tracker1.split_inefficient_tracks(fps)
-        if n_eff:
-            print(f"Efficiency check: {n_eff} track(s) cut where path/net "
-                  f"exceeded {MAX_PATH_NET_RATIO} over "
-                  f"{EFFICIENCY_WINDOW_SECONDS:.1f}s — slow identity weld")
+        if SPLIT_INEFFICIENT:
+            n_eff = tracker1.split_inefficient_tracks(fps)
+            if n_eff:
+                print(f"Efficiency check: {n_eff} track(s) cut where path/net "
+                      f"exceeded {MAX_PATH_NET_RATIO} over "
+                      f"{EFFICIENCY_WINDOW_SECONDS:.1f}s — slow identity weld")
+    print(f"\nOnline association: ReID adopts={tracker1.reid_adopts}, "
+          f"stale-map purges={tracker1.stale_map_purges}, "
+          f"emergency 100xxx mints={tracker1.collision_mints} "
+          f"(target ≈ 0)")
     if STITCH:
         n_links, n_thin = tracker1.merge_stitched(fps)
         dropped = n_thin if not STITCH_KEEP_THIN else 0
@@ -2366,6 +2515,8 @@ def main(
           f"detect_floor: {TRACK_DETECT_FLOOR}  "
           f"activation: {TRACK_ACTIVATION_THRESHOLD}  "
           f"match: {TRACK_MATCHING_THRESHOLD}  "
+          f"bt_lost: {BYTE_TRACK_LOST_SECONDS}s  "
+          f"reid: {REID_WINDOW_SECONDS}s  "
           f"touchline buffer: {TOUCHLINE_BUFFER_PX}px")
 
     if max_frames:
