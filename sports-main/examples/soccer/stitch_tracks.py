@@ -118,7 +118,8 @@ class Tracklet:
     def __init__(self, tid: int, frames: List[int], xy: np.ndarray, cls: int,
                  team: Optional[int] = None,
                  team_conf: Optional[float] = None,
-                 team_sep: float = 0.0):
+                 team_sep: float = 0.0,
+                 appearance=None):
         self.id = tid
         self.frames = frames
         self.xy = xy
@@ -130,6 +131,7 @@ class Tracklet:
         self.team = team
         self.team_conf = team_conf
         self.team_sep = team_sep
+        self.appearance = appearance
         self.start, self.end = frames[0], frames[-1]
 
     @property
@@ -178,12 +180,27 @@ def load_tracklets(path: str) -> Tuple[List[Tracklet], float]:
     return out, fps
 
 
+def _cosine(a, b) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if not na or not nb:
+        return None
+    return float(a @ b / (na * nb))
+
+
 def link_cost(a: Tracklet, b: Tracklet, fps: float,
-              max_gap_seconds: float = MAX_GAP_SECONDS) -> Optional[float]:
+              max_gap_seconds: float = MAX_GAP_SECONDS,
+              max_gap_frames: Optional[int] = None,
+              appearance_min_cosine: Optional[float] = None) -> Optional[float]:
     """Cost of claiming tracklet b continues tracklet a, or None if impossible."""
     gap = b.start - a.end
     if gap <= 0:                                  # overlapping in time
         return None                               # cannot be the same player
+    if max_gap_frames is not None and gap > max_gap_frames:
+        return None
     gap_s = gap / fps
     if gap_s > max_gap_seconds:
         return None
@@ -195,6 +212,12 @@ def link_cost(a: Tracklet, b: Tracklet, fps: float,
     # uses most of the plausible travel budget is worse than one that barely
     # moves, regardless of how long the gap was.
     cost = dist / max(reach, 1e-6) + 0.25 * (gap_s / max_gap_seconds)
+    sim = _cosine(a.appearance, b.appearance)
+    if appearance_min_cosine is not None and sim is not None:
+        if sim < appearance_min_cosine:
+            return None
+        # Reward high cosine (lower cost).
+        cost *= (1.0 - 0.35 * sim)
     # Team disagreement: HARD veto when both ends are confident and kit
     # separation is strong; otherwise a soft penalty (see team_colour).
     try:
@@ -209,17 +232,53 @@ def link_cost(a: Tracklet, b: Tracklet, fps: float,
 
 
 def build_cost_matrix(tracklets: Sequence[Tracklet], fps: float,
-                      max_gap_seconds: float = MAX_GAP_SECONDS) -> np.ndarray:
-    """Dense cost of every ordered pair; np.inf where a link is impossible."""
+                      max_gap_seconds: float = MAX_GAP_SECONDS,
+                      max_gap_frames: Optional[int] = None,
+                      appearance_min_cosine: Optional[float] = None,
+                      sim_percentile: Optional[float] = None,
+                      cost_percentile: Optional[float] = None) -> np.ndarray:
+    """Dense cost of every ordered pair; np.inf where a link is impossible.
+
+    When sim_percentile / cost_percentile are set (mot_sota_v6), only links in
+    the top appearance band and best motion-cost band survive — everyone else
+    is zeroed to inf before assignment.
+    """
     n = len(tracklets)
     cost = np.full((n, n), np.inf, dtype=np.float64)
+    sims = np.full((n, n), np.nan, dtype=np.float64)
     for i in range(n):
         for j in range(n):
             if i == j:
                 continue
-            c = link_cost(tracklets[i], tracklets[j], fps, max_gap_seconds)
+            c = link_cost(tracklets[i], tracklets[j], fps, max_gap_seconds,
+                          max_gap_frames=max_gap_frames,
+                          appearance_min_cosine=appearance_min_cosine)
             if c is not None:
                 cost[i, j] = c
+                sims[i, j] = _cosine(tracklets[i].appearance,
+                                     tracklets[j].appearance)
+
+    finite = np.isfinite(cost)
+    if not np.any(finite):
+        return cost
+
+    if sim_percentile is not None:
+        sim_vals = sims[finite & np.isfinite(sims)]
+        if len(sim_vals) >= 4:
+            sim_floor = float(np.percentile(sim_vals, sim_percentile))
+            # Only cull scored pairs below the band; unscored (no emb) keep
+            # motion evidence for the cost-percentile stage.
+            kill = finite & np.isfinite(sims) & (sims < sim_floor)
+            cost[kill] = np.inf
+            finite = np.isfinite(cost)
+
+    if cost_percentile is not None and np.any(finite):
+        cost_vals = cost[finite]
+        if len(cost_vals) >= 4:
+            cost_ceil = float(np.percentile(cost_vals, cost_percentile))
+            kill = finite & (cost > cost_ceil)
+            cost[kill] = np.inf
+
     return cost
 
 
@@ -227,7 +286,11 @@ def stitch_global(tracklets: Sequence[Tracklet], fps: float,
                   no_link_cost: float = NO_LINK_COST,
                   max_gap_seconds: float = MAX_GAP_SECONDS,
                   cost: Optional[np.ndarray] = None,
-                  keep_thin: bool = True):
+                  keep_thin: bool = True,
+                  max_gap_frames: Optional[int] = None,
+                  appearance_min_cosine: Optional[float] = None,
+                  sim_percentile: Optional[float] = None,
+                  cost_percentile: Optional[float] = None):
     """Assign successors globally: the cheapest consistent set of links.
 
     Formulated as a rectangular assignment problem. Rows are tracklets choosing
@@ -249,7 +312,12 @@ def stitch_global(tracklets: Sequence[Tracklet], fps: float,
     if n == 0:
         return [], []
     if cost is None:
-        cost = build_cost_matrix(tracklets, fps, max_gap_seconds)
+        cost = build_cost_matrix(
+            tracklets, fps, max_gap_seconds,
+            max_gap_frames=max_gap_frames,
+            appearance_min_cosine=appearance_min_cosine,
+            sim_percentile=sim_percentile,
+            cost_percentile=cost_percentile)
 
     # linear_sum_assignment cannot take inf, so price impossible links above
     # any slack column — they will never be chosen.

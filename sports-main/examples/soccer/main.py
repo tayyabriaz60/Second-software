@@ -98,7 +98,7 @@ CONFIG = SoccerPitchConfiguration()
 # Raised 1.5→3.0s for production panoramic matches: most ID-explosion fragments
 # die well under 3s, while real players (and post-stitch identities) survive.
 # Transient shadow / touchline artifacts must not keep a "valid" identity.
-MIN_SECONDS_TO_KEEP = 3.0
+MIN_SECONDS_TO_KEEP = 8.0
 # Movement floor as a RATE, not a total. A fixed pixel count silently gets
 # stricter the shorter the clip: 500px is trivial over 143s but a lot over 30s,
 # so on a 30s render it filtered out ten players who were tracked the whole
@@ -206,13 +206,17 @@ MAX_BODY_HEIGHTS_PER_SEC = 9.0
 # Baseline over which speed is measured. Long enough that detection jitter
 # averages out, short enough that a real teleport still registers.
 SPEED_WINDOW_SECONDS = 0.20
-# Path-efficiency split: OFF by default after mot_sota_v4 — cutting "inefficient"
-# tracks exploded fragmentation (413→697 IDs) without curing welds. Teleport
-# speed cuts (SPLIT_IMPLAUSIBLE) remain the only online physics scissors.
+# Path-efficiency / weld diagnostics (see WELD_GUARD below). Teleport speed
+# cuts (SPLIT_IMPLAUSIBLE) remain the primary physics scissors; weld guard
+# adds path/net inflection splits before metric export.
 SPLIT_INEFFICIENT = False
 EFFICIENCY_WINDOW_SECONDS = 3.0
-MAX_PATH_NET_RATIO = 12.0
-MIN_EFFICIENCY_PATH_PX = 200.0
+MAX_PATH_NET_RATIO = 8.0
+MIN_EFFICIENCY_PATH_PX = 180.0
+# mot_sota_v6: cut welded identities at handoff inflection before export.
+WELD_GUARD = True
+WELD_PATH_NET_CEILING = 25.0      # whole-track path/net above this → scan for cut
+WELD_TELEPORT_BODY_H_PER_SEC = 7.0  # stricter than general physics cut
 
 TEAM_CROPS_PER_ID = 10
 TEAM_CROP_STRIDE = 8
@@ -239,7 +243,7 @@ BRIDGE_MAX_FRAMES = 10
 # movers get a modestly wider gate; idle players stay tight (avoids the
 # measured failure mode of a flat growing radius).
 REID_SPRINT_PX_PER_SEC = 210.0
-REID_RADIUS_SPEED_GAIN = 0.30
+REID_RADIUS_SPEED_GAIN = 0.25
 REID_VELOCITY_DECAY = 0.88
 # Online CIELAB L-gap above which a lost-track candidate is rejected as the
 # wrong team (navy vs sky-blue kits). Below this, colour is ignored online.
@@ -250,15 +254,15 @@ TEAM_LAB_HARD_DELTA = 28.0
 TEAM_HARD_SEP_MIN = 1.35
 TEAM_HARD_VOTE_FRAC = 0.70
 
-# Fold offline-stitched fragments into single identities after pass 1. On by
-# default: measured on 36s of 14_09 it joined ~44 fragments, and the stitcher
-# declines rather than guesses (see stitch_tracks.NO_LINK_COST). Turn off with
-# --no_stitch to see the raw online tracker.
+# Fold offline-stitched fragments into single identities after pass 1.
 STITCH = True
-# Thin stitch links measured ~29% correct vs ~93% for confident ones
-# (mot_sota_v3: 106 thin). Drop them by default — fragmentation beats silent
-# wrong merges that create welds like id 367.
+# Thin stitch links measured ~29% correct — never apply them for v6.
 STITCH_KEEP_THIN = False
+# Confident-only stitch (mot_sota_v6): short gap + appearance p95 band.
+STITCH_MAX_GAP_FRAMES = 30
+STITCH_APPEARANCE_MIN_COSINE = 0.50
+STITCH_SIM_PERCENTILE = 95.0   # only top-5% appearance matches among candidates
+STITCH_COST_PERCENTILE = 5.0   # only best-5% motion costs among candidates
 
 # Which detector to use. 'yolo' is our local ultralytics weights; 'rfdetr' is
 # the Roboflow football-players v20 transformer, which handles this footage far
@@ -287,89 +291,54 @@ START_FRAME = 0
 TRACK_DUMP = False
 
 # ---------------------------------------------------------------------------
-# IDENTITY ARCHITECTURE (mot_sota_v4 post-mortem)
+# IDENTITY ARCHITECTURE (mot_sota_v5 → v6)
 # ---------------------------------------------------------------------------
-# Two systems were both trying to remember identity for ~10s:
-#   ByteTrack lost_track_buffer == REID_WINDOW  →  BT revives a raw track AFTER
-#   ReID already handed that canonical id to a NEW raw track → same-frame
-#   collision → _next_free_id() → 100xxx swarm (428 of 564 passed IDs in v4).
-#
-# Production split of responsibility:
-#   ByteTrack  = short-horizon IoU linker (sub-second coast through flicker)
-#   ReID layer = long-horizon identity memory (who is this after occlusion)
-# When ReID adopts a canonical id onto a new raw track, ALL other raw→cid
-# mappings for that cid are PURGED so a later BT revival cannot double-claim.
-# Collisions never mint 100xxx — loser reverts to its ByteTrack raw id.
+# v5: ByteTrack short IoU + ReID long memory + purge on adopt → killed 100xxx
+#     swarm (428 → 34) but left ~218 passed IDs (client needs ~24–40).
+# v6: Mahalanobis + hard appearance cosine on ReID; confident-only stitch
+#     (gap≤30f, no thin, p95 sim); weld-guard splits; roster filter 24–40.
 # ---------------------------------------------------------------------------
 BYTE_TRACK_LOST_SECONDS = 0.75   # IoU coast only; NOT long-term identity
 REID_WINDOW_SECONDS = 12.0       # long-horizon reclaim after occlusions
 
 # Spatial gating for re-id, as a fraction of the frame diagonal (~394px here).
-#
-# Two apparently-better schemes were measured on game.mp4 and both made things
-# considerably worse, so don't re-derive them from first principles:
-#   - Radius growing with the gap (4.5 px/frame, the measured sprint speed):
-#     IDs 30 -> 51. Most re-ids follow gaps of only a few frames, where that
-#     gives a 20-40px radius — tighter than a small player's own box jitter.
-#   - Refusing matches when two lost tracks are similarly close: IDs 30 -> 215.
-#     With ~25 players in a narrow band there is nearly always a second
-#     candidate nearby, so it refused almost every match and ByteTrack opened
-#     a new ID instead.
-# The flat radius does over-merge occasionally (one ID landing on two players),
-# which is worth revisiting — but with appearance features, not geometry.
-#
-# 0.14: slightly wider than v4's 0.12 now that BT no longer double-owns identity;
-# ReID must catch the handoff when BT drops a track at 0.75s.
-REID_DISTANCE_FRACTION = 0.14
+REID_DISTANCE_FRACTION = 0.12
 
 # How long a track must have been unseen before another detection may adopt its
-# canonical id. Previously any track not seen THIS frame was fair game, so a
-# momentary detection miss let a second player steal a live id — the "player 2
-# hands his number over" failure. A player genuinely lost is absent for more
-# than a frame or two.
+# canonical id.
 REID_MIN_LOST_FRAMES = 2
 
-# Appearance tie-breaker for re-id. Among lost tracks already inside the
-# spatial radius, prefer the one that also LOOKS most like this detection,
-# rather than blindly taking the nearest — which is how one ID ends up on two
-# different players standing close together.
-#
-# Measured separation (probability a same-player crop pair scores above a
-# different-player pair), and note how much it depends on crop size:
-#
-#                         game.mp4 (45px)   ultrawide (77px)
-#   torso colour hist          0.705             0.737
-#   SigLIP embeddings          0.730             0.883
-#
-# Colour barely improved; the LEARNED features are what needed resolution. At
-# 45px the two were equivalent so the free one won, but on ultrawide footage
-# SigLIP is far stronger and worth the compute.
-#
-# Still ranking, not vetoing. Even at 0.883 the distributions overlap, and a
-# hard threshold that rejects matches is how an earlier attempt turned 30 IDs
-# into 215. Teammates in identical kit remain indistinguishable by
-# construction; this only helps when the confusion is between opposing teams.
-# MEASURED OFF. Even at 0.883 separation on ultrawide footage, weighting
-# appearance made over-merges WORSE on a 30s segment (8 -> 12 at weight 0.3/0.5)
-# and pure distance won on every metric:
-#     weight 0.0 -> 33 ids, 23 valid, 8 over-merged, 27 alive>=75%
-#     weight 0.5 -> 33 ids, 21 valid, 12 over-merged, 26 alive>=75%
-#
-# The likely reason is that this hook is the wrong place: _find_lost_match only
-# runs when ByteTrack hands us a NEW track id. When ByteTrack's own internal
-# association merges two players, that decision never reaches this code, so no
-# amount of appearance evidence here can overrule it. Fixing merges means
-# changing the association inside the tracker, or splitting merged tracks
-# afterwards — not re-weighting this step.
-#
-# Left wired up (and measured) so it can be revisited cheaply.
-APPEARANCE_WEIGHT = 0.0     # 0 = pure distance, 1 = pure appearance
+# Isotropic Mahalanobis gate on (x,y) residual vs CV prediction (v6).
+# sigma grows with gap so a 2-frame flicker stays open but a duel teleport fails.
+REID_POS_SIGMA_PX = 28.0
+REID_VEL_SIGMA_PX = 6.0
+REID_MAHA_MAX = 2.5
+
+# Appearance: hard veto (not soft rank-only). Close-contact duels require
+# cosine ≥ REID_APPEARANCE_MIN_COSINE when both embeddings exist; otherwise
+# the reclaim is declined rather than guessed.
+APPEARANCE_HARD_GATE = True
+REID_APPEARANCE_MIN_COSINE = 0.42
+REID_DUEL_RADIUS_FRAC = 0.55   # of adaptive radius: 2+ cands inside ⇒ duel
+REID_DUEL_MIN_COSINE = 0.55    # stricter appearance in a duel
+
+# Soft rank weight among candidates that already passed hard gates.
+APPEARANCE_WEIGHT = 0.40
 
 # Embedding every detection every frame would mean ~222k transformer passes on
 # a 2.4-minute clip. We only need one when deciding a NEW track's identity, or
 # to refresh a known track's signature occasionally.
-APPEARANCE_REFRESH_FRAMES = 60
+APPEARANCE_REFRESH_FRAMES = 45
 APPEARANCE_MIN_CROP_PX    = 12   # smaller than this carries no usable signal
+
+# Client deliverable band: active players + main subs.
+TARGET_PASSED_MIN = 24
+TARGET_PASSED_MAX = 40
+# Tracks above this path/net after weld-guard are treated as still-corrupt and
+# excluded from the passed roster (stats would be meaningless).
+MAX_PASSED_PATH_NET = 30.0
+# Collision-split emergency IDs must not enter the client roster.
+EXCLUDE_COLLISION_IDS_FROM_PASSED = True
 
 # Movement is measured as path length, sampled every few frames. Comparing
 # first position to last position (the old approach) scores a player who runs
@@ -510,8 +479,8 @@ def video_frames(source_video_path: str, stride: int = 1, max_frames: int = None
     return itertools.islice(gen, max_frames) if max_frames else gen
 
 
-# Set from --run_label, or a timestamp. Keeps each run's outputs distinct.
-RUN_LABEL = None
+# Set from --run_label, or defaults to mot_sota_v6 for the identification push.
+RUN_LABEL = 'mot_sota_v6'
 
 
 def output_path_for(source_video_path: str, suffix: str) -> str:
@@ -1066,8 +1035,26 @@ class PlayerReIDTracker:
         px, py = self._pred_xy(cid)
         return float(np.hypot(cx - px, cy - py))
 
-    def _lost_match_score(self, cid, cx, cy, emb=None, det_lab=None):
-        """Score in [0,1] for reclaiming lost cid, or None if gated out."""
+    def _mahalanobis(self, cid, cx, cy, frames_ago: int) -> float:
+        """Isotropic Mahalanobis distance of (cx,cy) to CV-predicted state."""
+        pred_x, pred_y = self._pred_xy(cid, frames_ago)
+        vel = self._exit_velocity(cid)
+        speed = float(np.linalg.norm(vel))
+        sigma = (REID_POS_SIGMA_PX
+                 + frames_ago * max(REID_VEL_SIGMA_PX, 0.5 * speed))
+        sigma = max(sigma, 1e-3)
+        return float(np.hypot(cx - pred_x, cy - pred_y) / sigma)
+
+    def _lost_match_score(self, cid, cx, cy, emb=None, det_lab=None,
+                          duel: bool = False):
+        """Score in [0,1] for reclaiming lost cid, or None if gated out.
+
+        v6 gates (all must pass):
+          1. lost-window + team Lab veto
+          2. Mahalanobis residual ≤ REID_MAHA_MAX
+          3. inside adaptive spatial radius
+          4. hard appearance cosine when embeddings exist (stricter in duels)
+        """
         if cid not in self.last_seen:
             return None
         lx, ly, last_frame = self.last_seen[cid]
@@ -1078,14 +1065,34 @@ class PlayerReIDTracker:
             return None
         if self._lab_team_conflict(cid, det_lab):
             return None
+        maha = self._mahalanobis(cid, cx, cy, frames_ago)
+        if maha > REID_MAHA_MAX:
+            return None
         pred_x, pred_y = self._pred_xy(cid, frames_ago)
         dist = float(np.hypot(cx - pred_x, cy - pred_y))
         radius = self._adaptive_radius(cid, frames_ago)
         if dist >= radius:
             return None
-        score = 1.0 - dist / radius
+
         sim = self._similarity(emb, self.id_appearance.get(cid))
-        if sim is not None:
+        if APPEARANCE_HARD_GATE:
+            min_cos = REID_DUEL_MIN_COSINE if duel else REID_APPEARANCE_MIN_COSINE
+            track_emb = self.id_appearance.get(cid)
+            if emb is not None and track_emb is not None:
+                if sim is None or sim < min_cos:
+                    return None  # appearance veto — refuse mid-clip switch
+            elif duel:
+                # Close-contact duel without appearance evidence: do not guess.
+                return None
+            elif emb is None or track_emb is None:
+                # Spatial-only reclaim only when Mahalanobis is very tight.
+                if maha > 1.2:
+                    return None
+
+        spatial = 1.0 - dist / radius
+        maha_term = max(0.0, 1.0 - maha / REID_MAHA_MAX)
+        score = 0.5 * spatial + 0.5 * maha_term
+        if sim is not None and APPEARANCE_WEIGHT > 0:
             score = ((1 - APPEARANCE_WEIGHT) * score
                      + APPEARANCE_WEIGHT * max(0.0, sim))
         return score
@@ -1093,11 +1100,28 @@ class PlayerReIDTracker:
     def _find_lost_match(self, cx, cy, emb=None, det_lab=None, exclude=None):
         """Greedy best lost-track reclaim (used for single-det fallback)."""
         exclude = exclude or set()
+        # Detect duel: multiple lost tracks inside a fraction of the radius.
+        cands = []
+        for cid in self.last_seen:
+            if cid in exclude:
+                continue
+            if cid not in self.last_seen:
+                continue
+            frames_ago = self.frame_n - self.last_seen[cid][2]
+            if frames_ago < REID_MIN_LOST_FRAMES or frames_ago > self.window_frames:
+                continue
+            radius = self._adaptive_radius(cid, frames_ago)
+            pred_x, pred_y = self._pred_xy(cid, frames_ago)
+            dist = float(np.hypot(cx - pred_x, cy - pred_y))
+            if dist < radius * REID_DUEL_RADIUS_FRAC:
+                cands.append(cid)
+        duel = len(cands) >= 2
         best_id, best_score = None, -1.0
         for cid in self.last_seen:
             if cid in exclude:
                 continue
-            score = self._lost_match_score(cid, cx, cy, emb, det_lab)
+            score = self._lost_match_score(
+                cid, cx, cy, emb, det_lab, duel=duel)
             if score is not None and score > best_score:
                 best_score, best_id = score, cid
         return best_id
@@ -1114,7 +1138,6 @@ class PlayerReIDTracker:
         """
         if not need_match:
             return {}
-        # Candidate pool: currently lost canonicals.
         lost = []
         for cid, (_, _, last_frame) in self.last_seen.items():
             frames_ago = self.frame_n - last_frame
@@ -1125,26 +1148,33 @@ class PlayerReIDTracker:
             return {}
 
         n_d, n_l = len(need_match), len(lost)
-        # Cost = 1 - score; impossible pairs get a large finite cost so the
-        # rectangular slack (no-match) is preferred via a threshold.
         BIG = 10.0
         cost = np.full((n_d, n_l), BIG, dtype=np.float64)
         for di, det in enumerate(need_match):
+            # Per-detection duel: ≥2 lost cids inside duel radius.
+            near = 0
+            cx, cy = det['cx'], det['cy']
+            for cid in lost:
+                frames_ago = self.frame_n - self.last_seen[cid][2]
+                radius = self._adaptive_radius(cid, frames_ago)
+                pred_x, pred_y = self._pred_xy(cid, frames_ago)
+                if np.hypot(cx - pred_x, cy - pred_y) < radius * REID_DUEL_RADIUS_FRAC:
+                    near += 1
+            duel = near >= 2
             for lj, cid in enumerate(lost):
                 s = self._lost_match_score(
-                    cid, det['cx'], det['cy'], det['emb'], det['det_lab'])
+                    cid, cx, cy, det['emb'], det['det_lab'], duel=duel)
                 if s is not None:
                     cost[di, lj] = 1.0 - s
 
-        # Slack columns: decline a reclaim (cost 0.55 ≈ require score ≥ 0.45).
-        NO_MATCH = 0.55
+        # Stricter no-match: require score ≥ 0.50 after hard gates.
+        NO_MATCH = 0.50
         slack = np.full((n_d, n_d), BIG, dtype=np.float64)
         np.fill_diagonal(slack, NO_MATCH)
         try:
             from scipy.optimize import linear_sum_assignment
             rows, cols = linear_sum_assignment(np.hstack([cost, slack]))
         except Exception:
-            # No scipy: fall back to greedy per-det best.
             out = {}
             used = set()
             for det in need_match:
@@ -1228,10 +1258,12 @@ class PlayerReIDTracker:
             return sv.Detections.empty()
 
         embeddings = {}
-        if frame is not None and APPEARANCE_WEIGHT > 0:
+        need_appearance = APPEARANCE_HARD_GATE or APPEARANCE_WEIGHT > 0
+        if frame is not None and need_appearance:
             wanted, crops = [], []
             for i, raw_id in enumerate(detections.tracker_id):
                 cid = self.id_map.get(int(raw_id))
+                # Always embed brand-new raw tracks (ReID decision); refresh known.
                 stale = (cid is None or
                          self.frame_n - self.id_embed_frame.get(cid, -10**9)
                          >= APPEARANCE_REFRESH_FRAMES)
@@ -1669,12 +1701,19 @@ class PlayerReIDTracker:
                         self.dominant_class(cid) or PLAYER_CLASS_ID,
                         team=self.id_team.get(cid),
                         team_conf=self.team_vote_frac.get(cid),
-                        team_sep=self.team_sep))
+                        team_sep=self.team_sep,
+                        appearance=self.id_appearance.get(cid)))
         if len(tracklets) < 2:
             return 0, 0
 
         identities, links = stitch.stitch_global(
-            tracklets, fps, keep_thin=STITCH_KEEP_THIN)
+            tracklets, fps,
+            keep_thin=STITCH_KEEP_THIN,
+            max_gap_frames=STITCH_MAX_GAP_FRAMES,
+            appearance_min_cosine=STITCH_APPEARANCE_MIN_COSINE,
+            sim_percentile=STITCH_SIM_PERCENTILE,
+            cost_percentile=STITCH_COST_PERCENTILE,
+        )
 
         # Each chain collapses onto its lowest id, which keeps numbers stable
         # and small rather than renaming everyone.
@@ -1723,25 +1762,108 @@ class PlayerReIDTracker:
                 self.id_map[raw] = remap[cid]
         return n_applied, n_thin
 
+    def weld_guard(self, fps: float) -> int:
+        """Split identity welds before metric export (mot_sota_v6).
+
+        Does NOT reset id_splits (physics pass may have already cut teleports).
+        Adds: (1) stricter residual teleports, (2) rolling path/net inflection
+        cuts on tracks whose whole-track path/net still exceeds the ceiling.
+        """
+        splits = 0
+        win = max(1, int(SPEED_WINDOW_SECONDS * fps))
+        for cid in list(self.id_history.keys()):
+            hist = sorted(self.id_history[cid])
+            if len(hist) < 4:
+                continue
+            frames = np.array([h[0] for h in hist], dtype=float)
+            pos = np.array([[h[1], h[2]] for h in hist], dtype=float)
+            heights = np.array([h[3] if len(h) > 3 else 0.0 for h in hist])
+            if len(pos) >= 5:
+                k = np.ones(5) / 5
+                pad = np.vstack([np.repeat(pos[:1], 2, axis=0), pos,
+                                 np.repeat(pos[-1:], 2, axis=0)])
+                pos_s = np.stack([np.convolve(pad[:, 0], k, 'valid'),
+                                  np.convolve(pad[:, 1], k, 'valid')], axis=1)
+            else:
+                pos_s = pos
+            cuts = []
+            for i in range(1, len(hist)):
+                gap = frames[i] - frames[i - 1]
+                j = i - 1 if gap > 1 else max(0, i - win)
+                if gap <= 1 and frames[i] - frames[j] < win * 0.5:
+                    continue
+                dt = (frames[i] - frames[j]) / fps
+                if dt <= 0:
+                    continue
+                h = max(float(np.mean(heights[j:i + 1])), 1e-6)
+                if h < 8:
+                    continue
+                dist = float(np.hypot(pos_s[i][0] - pos_s[j][0],
+                                      pos_s[i][1] - pos_s[j][1]))
+                if dist / h / dt > WELD_TELEPORT_BODY_H_PER_SEC:
+                    cuts.append(i)
+            cuts = [c for k, c in enumerate(cuts)
+                    if k == 0 or c - cuts[k - 1] > win]
+            splits += self._apply_track_cuts(cid, hist, cuts)
+
+        # Rolling path/net on tracks that still look welded overall.
+        saved = globals()['MAX_PATH_NET_RATIO']
+        globals()['MAX_PATH_NET_RATIO'] = min(saved, 8.0)
+        n_eff = self.split_inefficient_tracks(fps)
+        globals()['MAX_PATH_NET_RATIO'] = saved
+        splits += n_eff
+        return splits
+
     def valid_ids(self) -> set:
-        valid = set()
+        """Client roster filter: clean long tracks in the 24–40 band."""
+        candidates = []
         for cid, count in self.id_frame_count.items():
             if count < self.min_frames:
                 continue
-            # Goalkeepers are exempt from the movement test entirely. Standing
-            # still IS the job, and a keeper who never leaves their box fails
-            # both the speed floor and the displacement rescue — which is how
-            # one ended up detected all clip but never drawn. The detector
-            # identifies the class confidently (0.71 on ultrawide), so trust it
-            # rather than inferring "not a player" from stillness.
+            if EXCLUDE_COLLISION_IDS_FROM_PASSED and cid >= 100000:
+                continue
             if self.dominant_class(cid) != GOALKEEPER_CLASS_ID:
                 seconds = count / self.fps
                 speed = self.id_path_px[cid] / seconds if seconds > 0 else 0.0
                 if (speed < MIN_SPEED_PX_PER_SEC and
                         self.net_displacement(cid) < MIN_NET_DISPLACEMENT_PX):
                     continue
-            valid.add(cid)
-        return valid
+            pn = self.path_net_ratio(cid)
+            if pn > MAX_PASSED_PATH_NET:
+                continue
+            candidates.append((cid, count, pn))
+
+        # Prefer long, efficient tracks.
+        candidates.sort(key=lambda t: (-t[1], t[2]))
+        if len(candidates) > TARGET_PASSED_MAX:
+            candidates = candidates[:TARGET_PASSED_MAX]
+        # If under-filled, relax path_net once to approach TARGET_PASSED_MIN.
+        if len(candidates) < TARGET_PASSED_MIN:
+            extra = []
+            taken = {c[0] for c in candidates}
+            for cid, count in self.id_frame_count.items():
+                if cid in taken or count < self.min_frames:
+                    continue
+                if EXCLUDE_COLLISION_IDS_FROM_PASSED and cid >= 100000:
+                    continue
+                pn = self.path_net_ratio(cid)
+                if pn > MAX_PASSED_PATH_NET * 2.0:
+                    continue
+                if self.dominant_class(cid) != GOALKEEPER_CLASS_ID:
+                    seconds = count / self.fps
+                    speed = self.id_path_px[cid] / seconds if seconds > 0 else 0.0
+                    if (speed < MIN_SPEED_PX_PER_SEC and
+                            self.net_displacement(cid) < MIN_NET_DISPLACEMENT_PX):
+                        continue
+                extra.append((cid, count, pn))
+            extra.sort(key=lambda t: (-t[1], t[2]))
+            for row in extra:
+                if len(candidates) >= TARGET_PASSED_MIN:
+                    break
+                candidates.append(row)
+            if len(candidates) > TARGET_PASSED_MAX:
+                candidates = candidates[:TARGET_PASSED_MAX]
+        return {c[0] for c in candidates}
 
 
 # ================================================================
@@ -1954,6 +2076,7 @@ def run_player_tracking(
         dropped = n_thin if not STITCH_KEEP_THIN else 0
         print(f"\nStitching: {n_links} links applied "
               f"({n_thin} thin{' — DROPPED' if dropped else ' kept'}), "
+              f"gap≤{STITCH_MAX_GAP_FRAMES}f, sim≥p{STITCH_SIM_PERCENTILE:.0f}, "
               f"{raw_id_count} -> {len(tracker1.id_frame_count)} identities")
         if n_thin and STITCH_KEEP_THIN:
             print(f"  {n_thin} links had a close runner-up. Thin links measured "
@@ -1962,13 +2085,19 @@ def run_player_tracking(
         elif dropped:
             print(f"  Declined {dropped} thin link(s) (STITCH_KEEP_THIN=False). "
                   f"Use --keep_thin_stitch to apply them for audit.")
+    if WELD_GUARD:
+        n_weld = tracker1.weld_guard(fps)
+        print(f"\nWeld guard: {n_weld} cut(s) "
+              f"(teleport>{WELD_TELEPORT_BODY_H_PER_SEC} bh/s or "
+              f"path_net ceiling {WELD_PATH_NET_CEILING})")
 
     good_ids = tracker1.valid_ids()
     all_ids  = set(tracker1.id_frame_count.keys())
 
-    print(f"\nPass 1 complete:")
+    print(f"\nPass 1 complete (mot_sota_v6):")
     print(f"  Total canonical IDs : {len(all_ids)}")
-    print(f"  Passed filters      : {len(good_ids)}")
+    print(f"  Passed filters      : {len(good_ids)} "
+          f"(target {TARGET_PASSED_MIN}-{TARGET_PASSED_MAX})")
     print(f"  Removed as noise    : {len(all_ids) - len(good_ids)}")
     collision_ids = sorted(i for i in all_ids if i >= 100000)
     if collision_ids:
@@ -2562,9 +2691,8 @@ if __name__ == '__main__':
     parser.add_argument('--focus_id', type=int,  default=None,
         help='Highlight a specific canonical player ID in PLAYER_TRACKING mode.')
     parser.add_argument('--run_label', type=str, default=None,
-        help='Tag for this run, used in output filenames. Defaults to a '
-             'timestamp so re-running the same video never overwrites the '
-             'previous result.')
+        help='Tag for this run, used in output filenames. Defaults to '
+             'mot_sota_v6. Pass a custom label to keep parallel experiments.')
     parser.add_argument('--touchline_buffer', type=int, default=None,
         help='Pixels below the fitted touchline that feet must sit. Needs '
              'calibrating per camera setup: the pitch-keypoint model can place '
