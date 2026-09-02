@@ -47,9 +47,9 @@ _session = None
 def session(weights: Optional[str] = None):
     """Load the ONNX session once.
 
-    CPUExecutionProvider on purpose: measured 5.6 fps against CoreML's 2.2 on
-    this machine. CoreML is the default in Roboflow's own package and is 2.6x
-    slower here.
+    Prefer CUDA on RunPod / GPU hosts; fall back to CPU if CUDA EP is missing
+    (local Mac/CPU boxes). Provider order is explicit so ORT does not silently
+    stay on CPU when a GPU is available.
     """
     global _session
     if _session is None:
@@ -57,8 +57,14 @@ def session(weights: Optional[str] = None):
         so = ort.SessionOptions()
         so.log_severity_level = 3
         so.intra_op_num_threads = os.cpu_count() or 4
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         _session = ort.InferenceSession(weights or WEIGHTS, so,
-                                        providers=['CPUExecutionProvider'])
+                                        providers=providers)
+        active = _session.get_providers()
+        print(f"  RF-DETR ONNX providers requested={providers} active={active}")
+        if 'CUDAExecutionProvider' not in active:
+            print("  WARNING: CUDAExecutionProvider not active — running on CPU. "
+                  "Install onnxruntime-gpu on RunPod for GPU inference.")
     return _session
 
 
