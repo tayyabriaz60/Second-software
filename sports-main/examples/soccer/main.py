@@ -1914,10 +1914,12 @@ class PlayerReIDTracker:
     def valid_ids(self) -> set:
         """Client roster filter: clean long tracks in the 24–40 band.
 
-        Never returns empty when tracks exist — progressive relaxation so a
-        harsh path_net / duration gate cannot yield Valid IDs: [].
+        Never returns empty when tracks exist — empty good_ids makes pass 2
+        draw zero ellipses (blank tracking video), which is worse than showing
+        a few short/noisy fragments on a calibration clip.
         """
-        def gather(max_path_net, min_frames, allow_collision=False):
+        def gather(max_path_net, min_frames, require_motion=True,
+                   allow_collision=False):
             out = []
             for cid, count in self.id_frame_count.items():
                 if count < min_frames:
@@ -1925,7 +1927,8 @@ class PlayerReIDTracker:
                 if (EXCLUDE_COLLISION_IDS_FROM_PASSED and not allow_collision
                         and cid >= 100000):
                     continue
-                if self.dominant_class(cid) != GOALKEEPER_CLASS_ID:
+                if (require_motion
+                        and self.dominant_class(cid) != GOALKEEPER_CLASS_ID):
                     seconds = count / self.fps
                     speed = (self.id_path_px[cid] / seconds
                              if seconds > 0 else 0.0)
@@ -1944,20 +1947,19 @@ class PlayerReIDTracker:
         if len(candidates) < TARGET_PASSED_MIN:
             candidates = gather(MAX_PASSED_PATH_NET * 2.0, min_f)
         if len(candidates) < TARGET_PASSED_MIN:
-            candidates = gather(MAX_PASSED_PATH_NET * 4.0,
-                                max(1, min_f // 2))
-        # Last resort: any track that lived at least ~1s — never empty the list
-        # when the tracker saw people. Empty Valid IDs makes pass-2 render blank.
+            candidates = gather(1e9, max(2, min_f // 3), require_motion=False)
+        # Absolute last resort: longest-lived tracks (≥2 frames). A 150-frame
+        # clip at 55fps has no 1s continuous fragments after MOT splits — the
+        # old ≥1s floor still returned [] and pass 2 rendered nothing.
         if not candidates and self.id_frame_count:
-            floor = max(1, int(1.0 * self.fps))
+            ranked = sorted(self.id_frame_count.items(), key=lambda x: -x[1])
             candidates = [
                 (cid, count, self.path_net_ratio(cid))
-                for cid, count in self.id_frame_count.items()
-                if count >= floor
+                for cid, count in ranked if count >= 2
             ]
-            candidates.sort(key=lambda t: (-t[1], t[2]))
-            print(f"  valid_ids: relaxed to {len(candidates)} tracks "
-                  f"(≥1s) after stricter filters kept 0")
+            print(f"  valid_ids: STRICT FILTERS KEPT 0 — using top "
+                  f"{min(len(candidates), TARGET_PASSED_MAX)} tracks by "
+                  f"lifetime so pass 2 can draw boxes")
         if len(candidates) > TARGET_PASSED_MAX:
             candidates = candidates[:TARGET_PASSED_MAX]
         return {c[0] for c in candidates}
@@ -2132,10 +2134,11 @@ def run_player_tracking(
     tracker1 = PlayerReIDTracker(video_info.width, video_info.height, fps, device)
     if max_frames:
         # Short calibration clips must not demand long continuous tracking.
-        cap = max(1, int(0.20 * max_frames))
+        # 10% of the clip (min 2 frames) — 150 frames → min_frames=15.
+        cap = max(2, int(0.10 * max_frames))
         if tracker1.min_frames > cap:
             print(f"  min_frames capped {tracker1.min_frames} → {cap} "
-                  f"(20% of --max_frames={max_frames})")
+                  f"(10% of --max_frames={max_frames})")
             tracker1.min_frames = cap
     for frame in tqdm(
         video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME),
@@ -2197,6 +2200,13 @@ def run_player_tracking(
 
     good_ids = tracker1.valid_ids()
     all_ids  = set(tracker1.id_frame_count.keys())
+    # Belt-and-suspenders: never hand pass 2 an empty keep-set when the tracker
+    # saw people — that produces a blank output video (no ellipses / minimap).
+    if not good_ids and all_ids:
+        ranked = sorted(tracker1.id_frame_count.items(), key=lambda x: -x[1])
+        good_ids = {cid for cid, n in ranked[:TARGET_PASSED_MAX] if n >= 2}
+        print(f"  WARNING: valid_ids empty — forcing render of "
+              f"{len(good_ids)} longest tracks")
 
     print(f"\nPass 1 complete (mot_sota_v6):")
     print(f"  Total canonical IDs : {len(all_ids)}")
