@@ -1,0 +1,3095 @@
+{
+ "fragment_to_identity": {
+  "28": 1,
+  "772": 1,
+  "100054": 1,
+  "981": 1,
+  "30": 2,
+  "100020": 2,
+  "1020": 2,
+  "3": 3,
+  "420": 3,
+  "461": 3,
+  "100043": 3,
+  "100113": 3,
+  "100114": 3,
+  "1282": 3,
+  "1339": 3,
+  "54": 4,
+  "100091": 4,
+  "1088": 4,
+  "1126": 4,
+  "1408": 4,
+  "1": 5,
+  "100001": 5,
+  "1289": 5,
+  "1336": 5,
+  "1349": 5,
+  "49": 6,
+  "100069": 6,
+  "100006": 6,
+  "100007": 6,
+  "100008": 6,
+  "949": 6,
+  "62": 7,
+  "160": 7,
+  "380": 7,
+  "560": 7,
+  "100049": 7,
+  "100050": 7,
+  "100048": 7,
+  "1324": 7,
+  "5": 8,
+  "945": 8,
+  "2": 9,
+  "494": 9,
+  "100030": 9,
+  "972": 9,
+  "100096": 9,
+  "37": 10,
+  "100071": 10,
+  "100072": 10,
+  "100073": 10,
+  "100074": 10,
+  "100075": 10,
+  "27": 11,
+  "74": 11,
+  "100070": 11,
+  "100010": 11,
+  "100101": 11,
+  "1340": 11,
+  "1372": 11,
+  "16": 12,
+  "331": 12,
+  "10": 13,
+  "100067": 13,
+  "700": 13,
+  "966": 13,
+  "100095": 13,
+  "1062": 13,
+  "100097": 13,
+  "100098": 13,
+  "1288": 13,
+  "12": 14,
+  "143": 14,
+  "100083": 14,
+  "100027": 14,
+  "20": 15,
+  "100079": 15,
+  "100011": 15,
+  "100102": 15,
+  "452": 15,
+  "100116": 15,
+  "100117": 15,
+  "1152": 15,
+  "1181": 15,
+  "23": 16,
+  "100015": 16,
+  "100016": 16,
+  "951": 16,
+  "100094": 16,
+  "67": 17,
+  "100028": 17,
+  "100029": 17,
+  "100107": 17,
+  "100108": 17,
+  "856": 17,
+  "100055": 17,
+  "100056": 17,
+  "100118": 17,
+  "100119": 17,
+  "1191": 17,
+  "1305": 17,
+  "8": 18,
+  "100066": 18,
+  "723": 18,
+  "1054": 18,
+  "29": 19,
+  "100082": 19,
+  "100019": 19,
+  "100103": 19,
+  "100104": 19,
+  "1381": 19,
+  "19": 20,
+  "220": 20,
+  "100031": 20,
+  "462": 20,
+  "716": 20,
+  "100053": 20,
+  "100": 21,
+  "327": 21,
+  "100032": 21,
+  "100109": 21,
+  "100110": 21,
+  "1335": 21,
+  "11": 22,
+  "100034": 22,
+  "679": 22,
+  "944": 22,
+  "1151": 22,
+  "1332": 22,
+  "104": 23,
+  "100025": 23,
+  "386": 23,
+  "100035": 23,
+  "638": 23,
+  "1248": 23,
+  "14": 24,
+  "100004": 24,
+  "100005": 24,
+  "100058": 24,
+  "102": 25,
+  "100017": 25,
+  "526": 25,
+  "100087": 25,
+  "100047": 25,
+  "1221": 25,
+  "15": 26,
+  "85": 26,
+  "1033": 26,
+  "1079": 26,
+  "100068": 27,
+  "394": 27,
+  "100036": 27,
+  "100111": 27,
+  "436": 27,
+  "100085": 27,
+  "600": 27,
+  "100088": 27,
+  "1011": 27,
+  "22": 28,
+  "100013": 28,
+  "100014": 28,
+  "722": 28,
+  "100089": 28,
+  "100090": 28,
+  "182": 29,
+  "427": 29,
+  "100041": 29,
+  "100042": 29,
+  "24": 30,
+  "273": 30,
+  "100003": 30,
+  "100099": 30,
+  "813": 30,
+  "912": 30,
+  "1393": 30,
+  "1410": 30,
+  "17": 31,
+  "241": 31,
+  "443": 31,
+  "488": 31,
+  "720": 31,
+  "100092": 31,
+  "827": 31,
+  "100100": 31,
+  "21": 32,
+  "100076": 32,
+  "100077": 32,
+  "100078": 32,
+  "805": 32,
+  "854": 32,
+  "927": 32,
+  "100093": 32,
+  "7": 33,
+  "100002": 33,
+  "591": 33,
+  "100051": 33,
+  "100115": 33,
+  "100052": 33,
+  "934": 33,
+  "1413": 33,
+  "55": 34,
+  "100024": 34,
+  "100086": 34,
+  "799": 34,
+  "100009": 34,
+  "971": 34,
+  "100059": 34,
+  "100060": 34,
+  "1265": 34,
+  "25": 35,
+  "100080": 35,
+  "405": 35,
+  "100037": 35,
+  "678": 35,
+  "1019": 35,
+  "26": 36,
+  "457": 36,
+  "100038": 36,
+  "660": 36,
+  "100081": 36,
+  "100018": 36,
+  "100040": 36,
+  "51": 37,
+  "100023": 37,
+  "100105": 37,
+  "383": 37,
+  "100039": 37,
+  "100112": 37,
+  "1016": 37,
+  "100062": 37,
+  "100063": 37,
+  "1205": 37,
+  "100064": 37,
+  "4": 38,
+  "144": 38,
+  "433": 38,
+  "1037": 38,
+  "940": 38,
+  "1322": 38,
+  "1386": 38,
+  "6": 39,
+  "341": 39,
+  "976": 39,
+  "100061": 39,
+  "1321": 39,
+  "13": 40,
+  "100022": 40,
+  "698": 40,
+  "100026": 40,
+  "100106": 40,
+  "1100": 40,
+  "1213": 40,
+  "1327": 40,
+  "100065": 40,
+  "18": 41,
+  "410": 41,
+  "674": 41,
+  "822": 41,
+  "100044": 41,
+  "100021": 41,
+  "9": 42,
+  "69": 42,
+  "270": 42,
+  "416": 42,
+  "632": 42,
+  "844": 42,
+  "959": 42,
+  "1038": 42,
+  "100057": 42
+ },
+ "identities": {
+  "1": {
+   "fragments": [
+    28,
+    772,
+    100054,
+    981
+   ],
+   "team": 1,
+   "first_frame": 40,
+   "last_frame": 17999,
+   "duration_s": 213.9,
+   "coverage": 0.655,
+   "links": [
+    {
+     "from": 28,
+     "to": 772,
+     "gap_s": 7.89,
+     "cost": 0.131,
+     "margin": -0.066,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100054,
+     "to": 981,
+     "gap_s": 43.64,
+     "cost": 0.158,
+     "margin": -0.065,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 772,
+     "to": 100054,
+     "gap_s": 0.02,
+     "cost": 0.419,
+     "margin": -0.318,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "2": {
+   "fragments": [
+    30,
+    100020,
+    1020
+   ],
+   "team": 0,
+   "first_frame": 59,
+   "last_frame": 17998,
+   "duration_s": 213.0,
+   "coverage": 0.652,
+   "links": [
+    {
+     "from": 30,
+     "to": 100020,
+     "gap_s": 0.02,
+     "cost": 0.005,
+     "margin": 0.039,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100020,
+     "to": 1020,
+     "gap_s": 6.17,
+     "cost": 0.058,
+     "margin": -0.008,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "3": {
+   "fragments": [
+    3,
+    420,
+    461,
+    100043,
+    100113,
+    100114,
+    1282,
+    1339
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 212.8,
+   "coverage": 0.652,
+   "links": [
+    {
+     "from": 3,
+     "to": 420,
+     "gap_s": 39.55,
+     "cost": 0.211,
+     "margin": -0.113,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 420,
+     "to": 461,
+     "gap_s": 1.14,
+     "cost": 0.163,
+     "margin": -0.097,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 461,
+     "to": 100043,
+     "gap_s": 0.02,
+     "cost": 0.002,
+     "margin": 0.028,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100043,
+     "to": 100113,
+     "gap_s": 0.02,
+     "cost": 0.01,
+     "margin": 0.043,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100113,
+     "to": 100114,
+     "gap_s": 0.02,
+     "cost": 0.034,
+     "margin": 0.011,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100114,
+     "to": 1282,
+     "gap_s": 10.52,
+     "cost": 0.127,
+     "margin": -0.108,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1282,
+     "to": 1339,
+     "gap_s": 1.45,
+     "cost": 0.845,
+     "margin": -0.652,
+     "confident": false,
+     "threshold": 0.95
+    }
+   ],
+   "player_name": null
+  },
+  "4": {
+   "fragments": [
+    54,
+    100091,
+    1088,
+    1126,
+    1408
+   ],
+   "team": 1,
+   "first_frame": 290,
+   "last_frame": 17842,
+   "duration_s": 212.1,
+   "coverage": 0.649,
+   "links": [
+    {
+     "from": 54,
+     "to": 100091,
+     "gap_s": 4.97,
+     "cost": 0.084,
+     "margin": -0.021,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100091,
+     "to": 1088,
+     "gap_s": 21.14,
+     "cost": 0.075,
+     "margin": 0.004,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1126,
+     "to": 1408,
+     "gap_s": 5.01,
+     "cost": 0.085,
+     "margin": 0.061,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1088,
+     "to": 1126,
+     "gap_s": 1.58,
+     "cost": 0.696,
+     "margin": -0.567,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "5": {
+   "fragments": [
+    1,
+    100001,
+    1289,
+    1336,
+    1349
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17464,
+   "duration_s": 207.5,
+   "coverage": 0.635,
+   "links": [
+    {
+     "from": 1,
+     "to": 100001,
+     "gap_s": 0.02,
+     "cost": 0.02,
+     "margin": 0.025,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100001,
+     "to": 1289,
+     "gap_s": 15.88,
+     "cost": 0.332,
+     "margin": -0.206,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1336,
+     "to": 1349,
+     "gap_s": 2.0,
+     "cost": 0.681,
+     "margin": -0.456,
+     "confident": false,
+     "threshold": 0.75
+    },
+    {
+     "from": 1289,
+     "to": 1336,
+     "gap_s": 3.32,
+     "cost": 1.132,
+     "margin": 10.0,
+     "confident": true,
+     "threshold": 1.15
+    }
+   ],
+   "player_name": null
+  },
+  "6": {
+   "fragments": [
+    49,
+    100069,
+    100006,
+    100007,
+    100008,
+    949
+   ],
+   "team": 1,
+   "first_frame": 226,
+   "last_frame": 17999,
+   "duration_s": 199.8,
+   "coverage": 0.612,
+   "links": [
+    {
+     "from": 49,
+     "to": 100069,
+     "gap_s": 4.7,
+     "cost": 0.073,
+     "margin": -0.067,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100069,
+     "to": 100006,
+     "gap_s": 0.02,
+     "cost": 0.019,
+     "margin": 0.06,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100006,
+     "to": 100007,
+     "gap_s": 0.02,
+     "cost": 0.016,
+     "margin": 0.026,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100007,
+     "to": 100008,
+     "gap_s": 0.02,
+     "cost": 0.019,
+     "margin": 0.02,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100008,
+     "to": 949,
+     "gap_s": 16.8,
+     "cost": 0.059,
+     "margin": 0.019,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "7": {
+   "fragments": [
+    62,
+    160,
+    380,
+    560,
+    100049,
+    100050,
+    100048,
+    1324
+   ],
+   "team": 0,
+   "first_frame": 464,
+   "last_frame": 17999,
+   "duration_s": 199.0,
+   "coverage": 0.609,
+   "links": [
+    {
+     "from": 160,
+     "to": 380,
+     "gap_s": 16.57,
+     "cost": 0.118,
+     "margin": -0.025,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 380,
+     "to": 560,
+     "gap_s": 6.35,
+     "cost": 0.096,
+     "margin": -0.012,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 560,
+     "to": 100049,
+     "gap_s": 0.02,
+     "cost": 0.005,
+     "margin": 0.068,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100049,
+     "to": 100050,
+     "gap_s": 0.02,
+     "cost": 0.076,
+     "margin": -0.016,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100050,
+     "to": 100048,
+     "gap_s": 12.32,
+     "cost": 0.047,
+     "margin": 0.042,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 62,
+     "to": 160,
+     "gap_s": 7.13,
+     "cost": 0.62,
+     "margin": 0.303,
+     "confident": false,
+     "threshold": 0.75
+    },
+    {
+     "from": 100048,
+     "to": 1324,
+     "gap_s": 3.5,
+     "cost": 0.576,
+     "margin": -0.456,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "8": {
+   "fragments": [
+    5,
+    945
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17982,
+   "duration_s": 197.4,
+   "coverage": 0.604,
+   "links": [
+    {
+     "from": 5,
+     "to": 945,
+     "gap_s": 34.71,
+     "cost": 0.152,
+     "margin": -0.079,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "9": {
+   "fragments": [
+    2,
+    494,
+    100030,
+    972,
+    100096
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 196.1,
+   "coverage": 0.6,
+   "links": [
+    {
+     "from": 2,
+     "to": 494,
+     "gap_s": 4.95,
+     "cost": 0.053,
+     "margin": 0.001,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 494,
+     "to": 100030,
+     "gap_s": 7.8,
+     "cost": 0.053,
+     "margin": 0.051,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100030,
+     "to": 972,
+     "gap_s": 40.21,
+     "cost": 0.154,
+     "margin": -0.081,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 972,
+     "to": 100096,
+     "gap_s": 0.02,
+     "cost": 0.008,
+     "margin": 0.11,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "10": {
+   "fragments": [
+    37,
+    100071,
+    100072,
+    100073,
+    100074,
+    100075
+   ],
+   "team": 1,
+   "first_frame": 122,
+   "last_frame": 17999,
+   "duration_s": 194.6,
+   "coverage": 0.596,
+   "links": [
+    {
+     "from": 37,
+     "to": 100071,
+     "gap_s": 23.86,
+     "cost": 0.132,
+     "margin": -0.087,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100071,
+     "to": 100072,
+     "gap_s": 0.02,
+     "cost": 0.011,
+     "margin": 0.029,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100072,
+     "to": 100073,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.085,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100073,
+     "to": 100074,
+     "gap_s": 0.02,
+     "cost": 0.004,
+     "margin": 0.065,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100074,
+     "to": 100075,
+     "gap_s": 0.02,
+     "cost": 0.037,
+     "margin": 0.042,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "11": {
+   "fragments": [
+    27,
+    74,
+    100070,
+    100010,
+    100101,
+    1340,
+    1372
+   ],
+   "team": 0,
+   "first_frame": 28,
+   "last_frame": 17999,
+   "duration_s": 190.4,
+   "coverage": 0.583,
+   "links": [
+    {
+     "from": 27,
+     "to": 74,
+     "gap_s": 4.94,
+     "cost": 0.115,
+     "margin": -0.042,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 74,
+     "to": 100070,
+     "gap_s": 23.91,
+     "cost": 0.09,
+     "margin": -0.007,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100070,
+     "to": 100010,
+     "gap_s": 0.02,
+     "cost": 0.0,
+     "margin": 0.087,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100010,
+     "to": 100101,
+     "gap_s": 0.02,
+     "cost": 0.003,
+     "margin": 0.048,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1340,
+     "to": 1372,
+     "gap_s": 2.09,
+     "cost": 0.096,
+     "margin": 0.188,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100101,
+     "to": 1340,
+     "gap_s": 7.49,
+     "cost": 0.891,
+     "margin": -0.698,
+     "confident": false,
+     "threshold": 0.95
+    }
+   ],
+   "player_name": null
+  },
+  "12": {
+   "fragments": [
+    16,
+    331
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 189.9,
+   "coverage": 0.582,
+   "links": [
+    {
+     "from": 16,
+     "to": 331,
+     "gap_s": 22.68,
+     "cost": 0.328,
+     "margin": -0.207,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "13": {
+   "fragments": [
+    10,
+    100067,
+    700,
+    966,
+    100095,
+    1062,
+    100097,
+    100098,
+    1288
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17775,
+   "duration_s": 187.8,
+   "coverage": 0.575,
+   "links": [
+    {
+     "from": 100067,
+     "to": 700,
+     "gap_s": 16.89,
+     "cost": 0.067,
+     "margin": -0.021,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 700,
+     "to": 966,
+     "gap_s": 39.72,
+     "cost": 0.166,
+     "margin": -0.063,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 966,
+     "to": 100095,
+     "gap_s": 0.02,
+     "cost": 0.04,
+     "margin": 0.011,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100095,
+     "to": 1062,
+     "gap_s": 3.74,
+     "cost": 0.289,
+     "margin": -0.229,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1062,
+     "to": 100097,
+     "gap_s": 0.02,
+     "cost": 0.005,
+     "margin": 0.055,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100097,
+     "to": 100098,
+     "gap_s": 0.02,
+     "cost": 0.03,
+     "margin": -0.011,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 10,
+     "to": 100067,
+     "gap_s": 0.02,
+     "cost": 0.429,
+     "margin": -0.278,
+     "confident": false,
+     "threshold": 0.55
+    },
+    {
+     "from": 100098,
+     "to": 1288,
+     "gap_s": 7.62,
+     "cost": 0.594,
+     "margin": -0.53,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "14": {
+   "fragments": [
+    12,
+    143,
+    100083,
+    100027
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 186.5,
+   "coverage": 0.571,
+   "links": [
+    {
+     "from": 143,
+     "to": 100083,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.032,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100083,
+     "to": 100027,
+     "gap_s": 0.02,
+     "cost": 0.024,
+     "margin": 0.059,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 12,
+     "to": 143,
+     "gap_s": 16.09,
+     "cost": 0.36,
+     "margin": -0.032,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "15": {
+   "fragments": [
+    20,
+    100079,
+    100011,
+    100102,
+    452,
+    100116,
+    100117,
+    1152,
+    1181
+   ],
+   "team": 0,
+   "first_frame": 3,
+   "last_frame": 17787,
+   "duration_s": 183.9,
+   "coverage": 0.563,
+   "links": [
+    {
+     "from": 20,
+     "to": 100079,
+     "gap_s": 0.02,
+     "cost": 0.008,
+     "margin": 0.024,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100079,
+     "to": 100011,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.044,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100011,
+     "to": 100102,
+     "gap_s": 0.02,
+     "cost": 0.016,
+     "margin": 0.122,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100102,
+     "to": 452,
+     "gap_s": 13.43,
+     "cost": 0.331,
+     "margin": -0.161,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 452,
+     "to": 100116,
+     "gap_s": 17.22,
+     "cost": 0.101,
+     "margin": -0.096,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100116,
+     "to": 100117,
+     "gap_s": 0.02,
+     "cost": 0.075,
+     "margin": -0.015,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1152,
+     "to": 1181,
+     "gap_s": 8.95,
+     "cost": 0.107,
+     "margin": -0.039,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100117,
+     "to": 1152,
+     "gap_s": 1.69,
+     "cost": 0.685,
+     "margin": -0.545,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "16": {
+   "fragments": [
+    23,
+    100015,
+    100016,
+    951,
+    100094
+   ],
+   "team": 1,
+   "first_frame": 10,
+   "last_frame": 17991,
+   "duration_s": 179.8,
+   "coverage": 0.551,
+   "links": [
+    {
+     "from": 23,
+     "to": 100015,
+     "gap_s": 0.02,
+     "cost": 0.008,
+     "margin": 0.078,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100015,
+     "to": 100016,
+     "gap_s": 0.02,
+     "cost": 0.04,
+     "margin": 0.005,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100016,
+     "to": 951,
+     "gap_s": 34.66,
+     "cost": 0.125,
+     "margin": -0.04,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 951,
+     "to": 100094,
+     "gap_s": 0.02,
+     "cost": 0.004,
+     "margin": 0.073,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "17": {
+   "fragments": [
+    67,
+    100028,
+    100029,
+    100107,
+    100108,
+    856,
+    100055,
+    100056,
+    100118,
+    100119,
+    1191,
+    1305
+   ],
+   "team": 0,
+   "first_frame": 530,
+   "last_frame": 17999,
+   "duration_s": 178.0,
+   "coverage": 0.545,
+   "links": [
+    {
+     "from": 67,
+     "to": 100028,
+     "gap_s": 9.93,
+     "cost": 0.087,
+     "margin": -0.037,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100028,
+     "to": 100029,
+     "gap_s": 0.02,
+     "cost": 0.004,
+     "margin": 0.041,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100029,
+     "to": 100107,
+     "gap_s": 0.02,
+     "cost": 0.004,
+     "margin": 0.09,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100107,
+     "to": 100108,
+     "gap_s": 0.02,
+     "cost": 0.005,
+     "margin": 0.049,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100108,
+     "to": 856,
+     "gap_s": 15.8,
+     "cost": 0.186,
+     "margin": -0.098,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 856,
+     "to": 100055,
+     "gap_s": 0.02,
+     "cost": 0.04,
+     "margin": 0.03,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100055,
+     "to": 100056,
+     "gap_s": 0.02,
+     "cost": 0.027,
+     "margin": 0.033,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100056,
+     "to": 100118,
+     "gap_s": 0.02,
+     "cost": 0.004,
+     "margin": 0.028,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100118,
+     "to": 100119,
+     "gap_s": 0.02,
+     "cost": 0.062,
+     "margin": 0.02,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100119,
+     "to": 1191,
+     "gap_s": 12.12,
+     "cost": 0.053,
+     "margin": 0.054,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1191,
+     "to": 1305,
+     "gap_s": 13.05,
+     "cost": 0.304,
+     "margin": -0.222,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "18": {
+   "fragments": [
+    8,
+    100066,
+    723,
+    1054
+   ],
+   "team": 1,
+   "first_frame": 1,
+   "last_frame": 17932,
+   "duration_s": 176.6,
+   "coverage": 0.541,
+   "links": [
+    {
+     "from": 8,
+     "to": 100066,
+     "gap_s": 0.02,
+     "cost": 0.058,
+     "margin": -0.012,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100066,
+     "to": 723,
+     "gap_s": 11.2,
+     "cost": 0.066,
+     "margin": 0.013,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 723,
+     "to": 1054,
+     "gap_s": 8.93,
+     "cost": 0.11,
+     "margin": -0.019,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "19": {
+   "fragments": [
+    29,
+    100082,
+    100019,
+    100103,
+    100104,
+    1381
+   ],
+   "team": 0,
+   "first_frame": 49,
+   "last_frame": 17999,
+   "duration_s": 176.1,
+   "coverage": 0.539,
+   "links": [
+    {
+     "from": 29,
+     "to": 100082,
+     "gap_s": 0.02,
+     "cost": 0.011,
+     "margin": 0.034,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100082,
+     "to": 100019,
+     "gap_s": 0.02,
+     "cost": 0.016,
+     "margin": 0.028,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100019,
+     "to": 100103,
+     "gap_s": 0.02,
+     "cost": 0.008,
+     "margin": 0.066,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100103,
+     "to": 100104,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.058,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100104,
+     "to": 1381,
+     "gap_s": 8.62,
+     "cost": 0.097,
+     "margin": -0.051,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "20": {
+   "fragments": [
+    19,
+    220,
+    100031,
+    462,
+    716,
+    100053
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17924,
+   "duration_s": 174.9,
+   "coverage": 0.535,
+   "links": [
+    {
+     "from": 19,
+     "to": 220,
+     "gap_s": 14.03,
+     "cost": 0.127,
+     "margin": -0.05,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 220,
+     "to": 100031,
+     "gap_s": 0.02,
+     "cost": 0.095,
+     "margin": -0.037,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100031,
+     "to": 462,
+     "gap_s": 6.17,
+     "cost": 0.114,
+     "margin": -0.019,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 462,
+     "to": 716,
+     "gap_s": 4.59,
+     "cost": 0.068,
+     "margin": -0.013,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 716,
+     "to": 100053,
+     "gap_s": 0.02,
+     "cost": 0.001,
+     "margin": 0.078,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "21": {
+   "fragments": [
+    100,
+    327,
+    100032,
+    100109,
+    100110,
+    1335
+   ],
+   "team": 0,
+   "first_frame": 894,
+   "last_frame": 17998,
+   "duration_s": 173.0,
+   "coverage": 0.53,
+   "links": [
+    {
+     "from": 327,
+     "to": 100032,
+     "gap_s": 0.02,
+     "cost": 0.033,
+     "margin": 0.031,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100032,
+     "to": 100109,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.045,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100109,
+     "to": 100110,
+     "gap_s": 0.02,
+     "cost": 0.016,
+     "margin": 0.029,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100,
+     "to": 327,
+     "gap_s": 13.92,
+     "cost": 0.645,
+     "margin": 0.278,
+     "confident": false,
+     "threshold": 0.75
+    },
+    {
+     "from": 100110,
+     "to": 1335,
+     "gap_s": 18.45,
+     "cost": 0.585,
+     "margin": -0.365,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "22": {
+   "fragments": [
+    11,
+    100034,
+    679,
+    944,
+    1151,
+    1332
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 171.8,
+   "coverage": 0.526,
+   "links": [
+    {
+     "from": 11,
+     "to": 100034,
+     "gap_s": 16.84,
+     "cost": 0.08,
+     "margin": -0.015,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100034,
+     "to": 679,
+     "gap_s": 7.13,
+     "cost": 0.079,
+     "margin": 0.003,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 679,
+     "to": 944,
+     "gap_s": 32.17,
+     "cost": 0.155,
+     "margin": -0.049,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1151,
+     "to": 1332,
+     "gap_s": 7.87,
+     "cost": 0.445,
+     "margin": -0.28,
+     "confident": false,
+     "threshold": 0.55
+    },
+    {
+     "from": 944,
+     "to": 1151,
+     "gap_s": 0.53,
+     "cost": 0.595,
+     "margin": -0.301,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "23": {
+   "fragments": [
+    104,
+    100025,
+    386,
+    100035,
+    638,
+    1248
+   ],
+   "team": 1,
+   "first_frame": 933,
+   "last_frame": 17853,
+   "duration_s": 170.2,
+   "coverage": 0.521,
+   "links": [
+    {
+     "from": 100025,
+     "to": 386,
+     "gap_s": 30.12,
+     "cost": 0.102,
+     "margin": -0.015,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 386,
+     "to": 100035,
+     "gap_s": 0.02,
+     "cost": 0.047,
+     "margin": 0.094,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100035,
+     "to": 638,
+     "gap_s": 31.32,
+     "cost": 0.193,
+     "margin": -0.086,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 638,
+     "to": 1248,
+     "gap_s": 10.56,
+     "cost": 0.343,
+     "margin": -0.255,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 104,
+     "to": 100025,
+     "gap_s": 1.03,
+     "cost": 0.421,
+     "margin": -0.291,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "24": {
+   "fragments": [
+    14,
+    100004,
+    100005,
+    100058
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 169.1,
+   "coverage": 0.518,
+   "links": [
+    {
+     "from": 14,
+     "to": 100004,
+     "gap_s": 0.02,
+     "cost": 0.013,
+     "margin": 0.018,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100004,
+     "to": 100005,
+     "gap_s": 0.02,
+     "cost": 0.009,
+     "margin": 0.063,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100005,
+     "to": 100058,
+     "gap_s": 35.73,
+     "cost": 0.125,
+     "margin": -0.075,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "25": {
+   "fragments": [
+    102,
+    100017,
+    526,
+    100087,
+    100047,
+    1221
+   ],
+   "team": 0,
+   "first_frame": 915,
+   "last_frame": 17137,
+   "duration_s": 166.4,
+   "coverage": 0.509,
+   "links": [
+    {
+     "from": 102,
+     "to": 100017,
+     "gap_s": 22.17,
+     "cost": 0.157,
+     "margin": -0.08,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 526,
+     "to": 100087,
+     "gap_s": 0.02,
+     "cost": 0.003,
+     "margin": 0.027,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100087,
+     "to": 100047,
+     "gap_s": 0.02,
+     "cost": 0.014,
+     "margin": 0.031,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100017,
+     "to": 526,
+     "gap_s": 2.07,
+     "cost": 0.358,
+     "margin": -0.208,
+     "confident": false,
+     "threshold": 0.55
+    },
+    {
+     "from": 100047,
+     "to": 1221,
+     "gap_s": 4.48,
+     "cost": 0.451,
+     "margin": -0.331,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "26": {
+   "fragments": [
+    15,
+    85,
+    1033,
+    1079
+   ],
+   "team": 1,
+   "first_frame": 1,
+   "last_frame": 17839,
+   "duration_s": 164.2,
+   "coverage": 0.503,
+   "links": [
+    {
+     "from": 15,
+     "to": 85,
+     "gap_s": 10.58,
+     "cost": 0.086,
+     "margin": -0.035,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 85,
+     "to": 1033,
+     "gap_s": 24.17,
+     "cost": 0.328,
+     "margin": -0.31,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1033,
+     "to": 1079,
+     "gap_s": 6.19,
+     "cost": 0.758,
+     "margin": -0.599,
+     "confident": false,
+     "threshold": 0.95
+    }
+   ],
+   "player_name": null
+  },
+  "27": {
+   "fragments": [
+    100068,
+    394,
+    100036,
+    100111,
+    436,
+    100085,
+    600,
+    100088,
+    1011
+   ],
+   "team": 1,
+   "first_frame": 103,
+   "last_frame": 17291,
+   "duration_s": 159.0,
+   "coverage": 0.487,
+   "links": [
+    {
+     "from": 100068,
+     "to": 394,
+     "gap_s": 35.51,
+     "cost": 0.177,
+     "margin": -0.053,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 394,
+     "to": 100036,
+     "gap_s": 0.02,
+     "cost": 0.035,
+     "margin": 0.069,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100036,
+     "to": 100111,
+     "gap_s": 0.02,
+     "cost": 0.067,
+     "margin": 0.018,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100111,
+     "to": 436,
+     "gap_s": 1.27,
+     "cost": 0.023,
+     "margin": -0.001,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 436,
+     "to": 100085,
+     "gap_s": 0.02,
+     "cost": 0.009,
+     "margin": 0.013,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 600,
+     "to": 100088,
+     "gap_s": 0.02,
+     "cost": 0.009,
+     "margin": 0.025,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100088,
+     "to": 1011,
+     "gap_s": 9.54,
+     "cost": 0.063,
+     "margin": -0.015,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100085,
+     "to": 600,
+     "gap_s": 10.58,
+     "cost": 0.789,
+     "margin": 10.0,
+     "confident": true,
+     "threshold": 0.95
+    }
+   ],
+   "player_name": null
+  },
+  "28": {
+   "fragments": [
+    22,
+    100013,
+    100014,
+    722,
+    100089,
+    100090
+   ],
+   "team": 1,
+   "first_frame": 5,
+   "last_frame": 17726,
+   "duration_s": 155.6,
+   "coverage": 0.476,
+   "links": [
+    {
+     "from": 22,
+     "to": 100013,
+     "gap_s": 0.02,
+     "cost": 0.007,
+     "margin": 0.043,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100013,
+     "to": 100014,
+     "gap_s": 0.02,
+     "cost": 0.037,
+     "margin": 0.042,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100014,
+     "to": 722,
+     "gap_s": 60.48,
+     "cost": 0.203,
+     "margin": -0.15,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100089,
+     "to": 100090,
+     "gap_s": 0.02,
+     "cost": 0.02,
+     "margin": 0.025,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 722,
+     "to": 100089,
+     "gap_s": 19.23,
+     "cost": 0.58,
+     "margin": -0.378,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "29": {
+   "fragments": [
+    182,
+    427,
+    100041,
+    100042
+   ],
+   "team": 0,
+   "first_frame": 1673,
+   "last_frame": 17639,
+   "duration_s": 154.4,
+   "coverage": 0.473,
+   "links": [
+    {
+     "from": 182,
+     "to": 427,
+     "gap_s": 40.01,
+     "cost": 0.165,
+     "margin": -0.019,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 427,
+     "to": 100041,
+     "gap_s": 0.02,
+     "cost": 0.002,
+     "margin": 0.051,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100041,
+     "to": 100042,
+     "gap_s": 0.02,
+     "cost": 0.422,
+     "margin": -0.276,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "30": {
+   "fragments": [
+    24,
+    273,
+    100003,
+    100099,
+    813,
+    912,
+    1393,
+    1410
+   ],
+   "team": 0,
+   "first_frame": 17,
+   "last_frame": 17999,
+   "duration_s": 154.2,
+   "coverage": 0.472,
+   "links": [
+    {
+     "from": 24,
+     "to": 273,
+     "gap_s": 7.55,
+     "cost": 0.102,
+     "margin": -0.01,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100003,
+     "to": 100099,
+     "gap_s": 0.02,
+     "cost": 0.003,
+     "margin": 0.042,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100099,
+     "to": 813,
+     "gap_s": 29.32,
+     "cost": 0.147,
+     "margin": -0.057,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 813,
+     "to": 912,
+     "gap_s": 35.2,
+     "cost": 0.177,
+     "margin": -0.128,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 912,
+     "to": 1393,
+     "gap_s": 8.26,
+     "cost": 0.11,
+     "margin": -0.0,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1393,
+     "to": 1410,
+     "gap_s": 0.04,
+     "cost": 0.217,
+     "margin": -0.117,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 273,
+     "to": 100003,
+     "gap_s": 3.19,
+     "cost": 0.366,
+     "margin": -0.216,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "31": {
+   "fragments": [
+    17,
+    241,
+    443,
+    488,
+    720,
+    100092,
+    827,
+    100100
+   ],
+   "team": 1,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 151.7,
+   "coverage": 0.465,
+   "links": [
+    {
+     "from": 17,
+     "to": 241,
+     "gap_s": 8.02,
+     "cost": 0.076,
+     "margin": -0.07,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 241,
+     "to": 443,
+     "gap_s": 4.45,
+     "cost": 0.11,
+     "margin": 0.033,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 443,
+     "to": 488,
+     "gap_s": 4.57,
+     "cost": 0.055,
+     "margin": -0.002,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 488,
+     "to": 720,
+     "gap_s": 34.47,
+     "cost": 0.153,
+     "margin": -0.053,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100092,
+     "to": 827,
+     "gap_s": 4.57,
+     "cost": 0.162,
+     "margin": -0.097,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 827,
+     "to": 100100,
+     "gap_s": 15.01,
+     "cost": 0.054,
+     "margin": -0.04,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 720,
+     "to": 100092,
+     "gap_s": 0.02,
+     "cost": 0.4,
+     "margin": -0.299,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "32": {
+   "fragments": [
+    21,
+    100076,
+    100077,
+    100078,
+    805,
+    854,
+    927,
+    100093
+   ],
+   "team": 0,
+   "first_frame": 3,
+   "last_frame": 17724,
+   "duration_s": 150.6,
+   "coverage": 0.461,
+   "links": [
+    {
+     "from": 21,
+     "to": 100076,
+     "gap_s": 0.02,
+     "cost": 0.02,
+     "margin": 0.025,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100076,
+     "to": 100077,
+     "gap_s": 0.02,
+     "cost": 0.001,
+     "margin": 0.07,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100077,
+     "to": 100078,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.047,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100078,
+     "to": 805,
+     "gap_s": 28.6,
+     "cost": 0.2,
+     "margin": -0.084,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 805,
+     "to": 854,
+     "gap_s": 11.59,
+     "cost": 0.107,
+     "margin": -0.037,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 854,
+     "to": 927,
+     "gap_s": 15.1,
+     "cost": 0.112,
+     "margin": -0.034,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 927,
+     "to": 100093,
+     "gap_s": 0.02,
+     "cost": 0.035,
+     "margin": 0.043,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "33": {
+   "fragments": [
+    7,
+    100002,
+    591,
+    100051,
+    100115,
+    100052,
+    934,
+    1413
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17853,
+   "duration_s": 148.6,
+   "coverage": 0.455,
+   "links": [
+    {
+     "from": 7,
+     "to": 100002,
+     "gap_s": 0.02,
+     "cost": 0.021,
+     "margin": 0.017,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100002,
+     "to": 591,
+     "gap_s": 9.09,
+     "cost": 0.14,
+     "margin": -0.041,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 591,
+     "to": 100051,
+     "gap_s": 0.02,
+     "cost": 0.01,
+     "margin": 0.077,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100051,
+     "to": 100115,
+     "gap_s": 0.02,
+     "cost": 0.014,
+     "margin": 0.059,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100115,
+     "to": 100052,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.045,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100052,
+     "to": 934,
+     "gap_s": 15.02,
+     "cost": 0.064,
+     "margin": -0.06,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 934,
+     "to": 1413,
+     "gap_s": 10.85,
+     "cost": 0.481,
+     "margin": -0.382,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "34": {
+   "fragments": [
+    55,
+    100024,
+    100086,
+    799,
+    100009,
+    971,
+    100059,
+    100060,
+    1265
+   ],
+   "team": 1,
+   "first_frame": 292,
+   "last_frame": 17999,
+   "duration_s": 145.5,
+   "coverage": 0.446,
+   "links": [
+    {
+     "from": 55,
+     "to": 100024,
+     "gap_s": 0.02,
+     "cost": 0.003,
+     "margin": 0.162,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100024,
+     "to": 100086,
+     "gap_s": 20.96,
+     "cost": 0.081,
+     "margin": -0.078,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100086,
+     "to": 799,
+     "gap_s": 7.6,
+     "cost": 0.063,
+     "margin": 0.002,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 799,
+     "to": 100009,
+     "gap_s": 17.85,
+     "cost": 0.114,
+     "margin": -0.036,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100009,
+     "to": 971,
+     "gap_s": 15.75,
+     "cost": 0.068,
+     "margin": -0.053,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 971,
+     "to": 100059,
+     "gap_s": 0.02,
+     "cost": 0.006,
+     "margin": 0.06,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100059,
+     "to": 100060,
+     "gap_s": 0.02,
+     "cost": 0.037,
+     "margin": 0.081,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100060,
+     "to": 1265,
+     "gap_s": 11.1,
+     "cost": 0.313,
+     "margin": -0.245,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "35": {
+   "fragments": [
+    25,
+    100080,
+    405,
+    100037,
+    678,
+    1019
+   ],
+   "team": 0,
+   "first_frame": 19,
+   "last_frame": 17999,
+   "duration_s": 145.3,
+   "coverage": 0.445,
+   "links": [
+    {
+     "from": 25,
+     "to": 100080,
+     "gap_s": 0.02,
+     "cost": 0.022,
+     "margin": 0.089,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100080,
+     "to": 405,
+     "gap_s": 50.5,
+     "cost": 0.178,
+     "margin": -0.016,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100037,
+     "to": 678,
+     "gap_s": 4.81,
+     "cost": 0.033,
+     "margin": 0.015,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 678,
+     "to": 1019,
+     "gap_s": 47.1,
+     "cost": 0.186,
+     "margin": -0.078,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 405,
+     "to": 100037,
+     "gap_s": 0.02,
+     "cost": 0.402,
+     "margin": -0.225,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "36": {
+   "fragments": [
+    26,
+    457,
+    100038,
+    660,
+    100081,
+    100018,
+    100040
+   ],
+   "team": 1,
+   "first_frame": 19,
+   "last_frame": 17999,
+   "duration_s": 145.1,
+   "coverage": 0.444,
+   "links": [
+    {
+     "from": 457,
+     "to": 100038,
+     "gap_s": 36.18,
+     "cost": 0.149,
+     "margin": -0.048,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100038,
+     "to": 660,
+     "gap_s": 7.08,
+     "cost": 0.034,
+     "margin": -0.013,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 660,
+     "to": 100081,
+     "gap_s": 12.03,
+     "cost": 0.096,
+     "margin": -0.023,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100081,
+     "to": 100018,
+     "gap_s": 0.02,
+     "cost": 0.038,
+     "margin": 0.034,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 26,
+     "to": 457,
+     "gap_s": 9.98,
+     "cost": 0.391,
+     "margin": -0.082,
+     "confident": false,
+     "threshold": 0.55
+    },
+    {
+     "from": 100018,
+     "to": 100040,
+     "gap_s": 48.88,
+     "cost": 0.37,
+     "margin": -0.141,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "37": {
+   "fragments": [
+    51,
+    100023,
+    100105,
+    383,
+    100039,
+    100112,
+    1016,
+    100062,
+    100063,
+    1205,
+    100064
+   ],
+   "team": 1,
+   "first_frame": 239,
+   "last_frame": 17749,
+   "duration_s": 143.2,
+   "coverage": 0.438,
+   "links": [
+    {
+     "from": 100023,
+     "to": 100105,
+     "gap_s": 0.02,
+     "cost": 0.004,
+     "margin": 0.052,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100105,
+     "to": 383,
+     "gap_s": 37.92,
+     "cost": 0.137,
+     "margin": -0.037,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 383,
+     "to": 100039,
+     "gap_s": 33.08,
+     "cost": 0.257,
+     "margin": -0.236,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100039,
+     "to": 100112,
+     "gap_s": 0.02,
+     "cost": 0.019,
+     "margin": 0.043,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 51,
+     "to": 100023,
+     "gap_s": 0.02,
+     "cost": 0.419,
+     "margin": -0.289,
+     "confident": false,
+     "threshold": 0.55
+    },
+    {
+     "from": 1016,
+     "to": 100062,
+     "gap_s": 0.02,
+     "cost": 0.003,
+     "margin": 0.074,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100062,
+     "to": 100063,
+     "gap_s": 0.02,
+     "cost": 0.088,
+     "margin": -0.009,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100063,
+     "to": 1205,
+     "gap_s": 11.87,
+     "cost": 0.054,
+     "margin": -0.003,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1205,
+     "to": 100064,
+     "gap_s": 8.36,
+     "cost": 0.246,
+     "margin": -0.198,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100112,
+     "to": 1016,
+     "gap_s": 9.53,
+     "cost": 0.551,
+     "margin": -0.421,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "38": {
+   "fragments": [
+    4,
+    144,
+    433,
+    1037,
+    940,
+    1322,
+    1386
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 139.1,
+   "coverage": 0.426,
+   "links": [
+    {
+     "from": 4,
+     "to": 144,
+     "gap_s": 13.39,
+     "cost": 0.199,
+     "margin": -0.109,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 144,
+     "to": 433,
+     "gap_s": 40.9,
+     "cost": 0.217,
+     "margin": -0.119,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 433,
+     "to": 1037,
+     "gap_s": 48.37,
+     "cost": 0.219,
+     "margin": -0.04,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 940,
+     "to": 1322,
+     "gap_s": 20.12,
+     "cost": 0.135,
+     "margin": -0.029,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1322,
+     "to": 1386,
+     "gap_s": 10.67,
+     "cost": 0.114,
+     "margin": -0.068,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1037,
+     "to": 940,
+     "gap_s": 4.26,
+     "cost": 0.465,
+     "margin": -0.192,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  },
+  "39": {
+   "fragments": [
+    6,
+    341,
+    976,
+    100061,
+    1321
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 136.5,
+   "coverage": 0.418,
+   "links": [
+    {
+     "from": 6,
+     "to": 341,
+     "gap_s": 20.18,
+     "cost": 0.103,
+     "margin": -0.02,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 341,
+     "to": 976,
+     "gap_s": 41.93,
+     "cost": 0.223,
+     "margin": -0.112,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 976,
+     "to": 100061,
+     "gap_s": 0.02,
+     "cost": 0.096,
+     "margin": -0.037,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100061,
+     "to": 1321,
+     "gap_s": 22.25,
+     "cost": 0.101,
+     "margin": -0.033,
+     "confident": false,
+     "threshold": 0.35
+    }
+   ],
+   "player_name": null
+  },
+  "40": {
+   "fragments": [
+    13,
+    100022,
+    698,
+    100026,
+    100106,
+    1100,
+    1213,
+    1327,
+    100065
+   ],
+   "team": 1,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 131.8,
+   "coverage": 0.403,
+   "links": [
+    {
+     "from": 13,
+     "to": 100022,
+     "gap_s": 6.35,
+     "cost": 0.115,
+     "margin": -0.068,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100022,
+     "to": 698,
+     "gap_s": 23.04,
+     "cost": 0.171,
+     "margin": -0.108,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 698,
+     "to": 100026,
+     "gap_s": 22.35,
+     "cost": 0.081,
+     "margin": -0.063,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100026,
+     "to": 100106,
+     "gap_s": 0.02,
+     "cost": 0.005,
+     "margin": 0.061,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1213,
+     "to": 1327,
+     "gap_s": 14.23,
+     "cost": 0.147,
+     "margin": -0.057,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1327,
+     "to": 100065,
+     "gap_s": 0.02,
+     "cost": 0.033,
+     "margin": 0.071,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1100,
+     "to": 1213,
+     "gap_s": 8.35,
+     "cost": 0.419,
+     "margin": -0.255,
+     "confident": false,
+     "threshold": 0.55
+    },
+    {
+     "from": 100106,
+     "to": 1100,
+     "gap_s": 1.72,
+     "cost": 0.897,
+     "margin": -0.738,
+     "confident": false,
+     "threshold": 0.95
+    }
+   ],
+   "player_name": null
+  },
+  "41": {
+   "fragments": [
+    18,
+    410,
+    674,
+    822,
+    100044,
+    100021
+   ],
+   "team": 1,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 108.1,
+   "coverage": 0.331,
+   "links": [
+    {
+     "from": 18,
+     "to": 410,
+     "gap_s": 15.06,
+     "cost": 0.082,
+     "margin": -0.034,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 410,
+     "to": 674,
+     "gap_s": 11.98,
+     "cost": 0.073,
+     "margin": 0.011,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 674,
+     "to": 822,
+     "gap_s": 13.25,
+     "cost": 0.124,
+     "margin": -0.062,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 100044,
+     "to": 100021,
+     "gap_s": 3.08,
+     "cost": 0.072,
+     "margin": -0.04,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 822,
+     "to": 100044,
+     "gap_s": 30.19,
+     "cost": 0.61,
+     "margin": -0.351,
+     "confident": false,
+     "threshold": 0.75
+    }
+   ],
+   "player_name": null
+  },
+  "42": {
+   "fragments": [
+    9,
+    69,
+    270,
+    416,
+    632,
+    844,
+    959,
+    1038,
+    100057
+   ],
+   "team": 0,
+   "first_frame": 1,
+   "last_frame": 17999,
+   "duration_s": 59.5,
+   "coverage": 0.182,
+   "links": [
+    {
+     "from": 69,
+     "to": 270,
+     "gap_s": 38.25,
+     "cost": 0.269,
+     "margin": 0.006,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 270,
+     "to": 416,
+     "gap_s": 31.05,
+     "cost": 0.153,
+     "margin": 0.078,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 416,
+     "to": 632,
+     "gap_s": 35.11,
+     "cost": 0.151,
+     "margin": 0.072,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 632,
+     "to": 844,
+     "gap_s": 30.39,
+     "cost": 0.109,
+     "margin": 0.134,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 844,
+     "to": 959,
+     "gap_s": 37.67,
+     "cost": 0.135,
+     "margin": 0.013,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 959,
+     "to": 1038,
+     "gap_s": 12.81,
+     "cost": 0.056,
+     "margin": 0.079,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 1038,
+     "to": 100057,
+     "gap_s": 3.74,
+     "cost": 0.237,
+     "margin": -0.156,
+     "confident": false,
+     "threshold": 0.35
+    },
+    {
+     "from": 9,
+     "to": 69,
+     "gap_s": 7.19,
+     "cost": 0.353,
+     "margin": -0.208,
+     "confident": false,
+     "threshold": 0.55
+    }
+   ],
+   "player_name": null
+  }
+ },
+ "summary": {
+  "fragments": 268,
+  "identities": 42,
+  "median_identity_s": 172.4,
+  "identities_over_60s": 41,
+  "identities_over_300s": 0,
+  "low_confidence_links": 224,
+  "total_links": 226,
+  "clip_seconds": 326.6
+ },
+ "params": {
+  "roster_min": 22,
+  "roster_max": 26,
+  "run_label": "mot_sota_v11_10min"
+ }
+}
