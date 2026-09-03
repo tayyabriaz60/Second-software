@@ -1137,8 +1137,20 @@ class PlayerReIDTracker:
         """
         if not crops:
             return []
+        if not self.use_appearance:
+            return [None] * len(crops)
         if self._embedder is None:
-            self._embedder = TeamClassifier(device=self.device, batch_size=32)
+            try:
+                self._embedder = TeamClassifier(device=self.device, batch_size=32)
+            except Exception as e:
+                # transformers with an unsupported torch (e.g. "PyTorch >= 2.5
+                # is required") makes SiglipVisionModel unusable. Do not kill
+                # the run: fall back to distance-only ReID for the whole run.
+                print(f"  [appearance] SigLIP unavailable ({type(e).__name__}: "
+                      f"{str(e)[:120]}) — appearance ReID disabled, "
+                      f"using distance only")
+                self.use_appearance = False
+                return [None] * len(crops)
         try:
             return list(self._embedder.extract_features(crops))
         except Exception as e:
