@@ -316,6 +316,11 @@ MIN_EFFICIENCY_PATH_PX = 180.0
 WELD_GUARD = True
 WELD_PATH_NET_CEILING = 25.0      # whole-track path/net above this → scan for cut
 WELD_TELEPORT_BODY_H_PER_SEC = 7.0  # stricter than general physics cut
+# Rolling path/net cuts inside weld_guard. OFF: on the v8 10-min run this made
+# 536 cuts and turned 219 identities into 755. A footballer stops and turns
+# inside every 3 s window (path 100px, net 10px → ratio 10 > 8), so the test
+# fires on ordinary play, not on welds. Teleport cuts above stay on.
+WELD_GUARD_EFFICIENCY = False
 
 TEAM_CROPS_PER_ID = 10
 TEAM_CROP_STRIDE = 8
@@ -2019,11 +2024,25 @@ class PlayerReIDTracker:
                     if k == 0 or c - cuts[k - 1] > win]
             splits += self._apply_track_cuts(cid, hist, cuts)
 
-        # Rolling path/net on tracks that still look welded overall.
+        if not WELD_GUARD_EFFICIENCY:
+            return splits
+        # Rolling path/net, restricted to tracks that look welded overall —
+        # running it on every track cut ordinary direction changes (v8).
+        welded = {cid for cid in self.id_history
+                  if self.path_net_ratio(cid) > WELD_PATH_NET_CEILING}
+        if not welded:
+            return splits
+        keep = {cid: self.id_history[cid] for cid in list(self.id_history)
+                if cid not in welded}
+        for cid in keep:
+            self.id_history.pop(cid)
         saved = globals()['MAX_PATH_NET_RATIO']
         globals()['MAX_PATH_NET_RATIO'] = min(saved, 8.0)
-        n_eff = self.split_inefficient_tracks(fps)
-        globals()['MAX_PATH_NET_RATIO'] = saved
+        try:
+            n_eff = self.split_inefficient_tracks(fps)
+        finally:
+            globals()['MAX_PATH_NET_RATIO'] = saved
+            self.id_history.update(keep)
         splits += n_eff
         return splits
 
@@ -2342,7 +2361,8 @@ def run_player_tracking(
     print(f"  Removed as noise    : {len(all_ids) - len(good_ids)}")
     collision_ids = sorted(i for i in all_ids if i >= 100000)
     if collision_ids:
-        print(f"  Collision-split IDs : {len(collision_ids)} (≥100000)")
+        print(f"  Cut-generated IDs   : {len(collision_ids)} (≥100000, from "
+              f"physics/weld cuts; emergency mints={tracker1.collision_mints})")
     print(f"  Valid IDs           : {sorted(good_ids)}")
 
     if focus_id is not None and focus_id not in good_ids:
