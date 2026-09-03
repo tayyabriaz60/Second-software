@@ -426,6 +426,14 @@ START_FRAME = 0
 # roughly 25 ids x 300k frames of coordinates.
 TRACK_DUMP = False
 
+# Fragment -> player identity assignment after pass 1 (assign_identities.py).
+# On: rendered labels, JSON and minimap use identity ids (1..K) that gather
+# every fragment of a player; valid_ids() stays as a diagnostic only.
+ASSIGN_IDENTITIES = True
+ASSIGN_ROSTER_MIN = 22
+ASSIGN_ROSTER_MAX = 26
+IDENTITY_MAP_PATH = None      # --identity_map: load a corrected map instead
+
 # ---------------------------------------------------------------------------
 # IDENTITY ARCHITECTURE (mot_sota_v5 → v6)
 # ---------------------------------------------------------------------------
@@ -2401,6 +2409,70 @@ def run_player_tracking(
         print(f"  Warning: #{focus_id} didn't pass filters — showing anyway")
         good_ids.add(focus_id)
 
+    # ---- Identity assignment: every fragment onto one player id ----
+    # valid_ids() above is a FILTER (keep 24-40 long tracks). The client's
+    # deliverable is the opposite: all of a player's fragments on one id so
+    # stats aggregate. assign_identities chains fragments under cannot-link,
+    # body-height motion, team and appearance evidence, and writes an
+    # identity_map.json that is also the human-correction interface.
+    frag2pid: dict = {}
+    identity_map = None
+    if ASSIGN_IDENTITIES:
+        import assign_identities as ai
+        if IDENTITY_MAP_PATH:
+            identity_map = json.load(open(IDENTITY_MAP_PATH))
+            frag2pid = {int(k): int(v) for k, v in
+                        identity_map['fragment_to_identity'].items()}
+            print(f"\nIdentity map loaded from {IDENTITY_MAP_PATH}: "
+                  f"{len(set(frag2pid.values()))} identities "
+                  f"({len(frag2pid)} fragments)")
+        else:
+            frags = []
+            for cid, hist in tracker1.id_history.items():
+                if len(hist) < 2:
+                    continue
+                hist = sorted(hist)
+                emb = tracker1.id_appearance.get(cid)
+                frags.append(ai.Fragment(
+                    id=int(cid),
+                    frames=np.asarray([h[0] for h in hist], dtype=np.int64),
+                    xy=np.asarray([[h[1], h[2]] for h in hist], np.float32),
+                    h=np.asarray([h[3] if len(h) > 3 else 0.0 for h in hist],
+                                 np.float32),
+                    cls=int(tracker1.dominant_class(cid) or PLAYER_CLASS_ID),
+                    team=tracker1.id_team.get(cid),
+                    team_conf=tracker1.team_vote_frac.get(cid),
+                    appearance=(None if emb is None
+                                else np.asarray(emb, np.float32).ravel()),
+                    stable=bool(cid in good_ids)))
+            frags.sort(key=lambda f: f.start)
+            if frags:
+                print(f"\nIdentity assignment ({len(frags)} fragments -> "
+                      f"roster {ASSIGN_ROSTER_MIN}-{ASSIGN_ROSTER_MAX}):")
+                chains = ai.assign(frags, fps, float(tracker1.team_sep),
+                                   ASSIGN_ROSTER_MIN, ASSIGN_ROSTER_MAX)
+                total_frames = int(max(f.end for f in frags)) + 1
+                identity_map = ai.to_identity_map(
+                    chains, fps, total_frames,
+                    dict(roster_min=ASSIGN_ROSTER_MIN,
+                         roster_max=ASSIGN_ROSTER_MAX,
+                         run_label=RUN_LABEL))
+                frag2pid = {int(k): int(v) for k, v in
+                            identity_map['fragment_to_identity'].items()}
+                s = identity_map['summary']
+                print(f"  identities={s['identities']}  "
+                      f"median={s['median_identity_s']}s  "
+                      f">=60s: {s['identities_over_60s']}  "
+                      f"links={s['total_links']} "
+                      f"(low-confidence {s['low_confidence_links']})")
+        if identity_map is not None:
+            imap_path = output_path_for(source_video_path, 'identity_map')
+            with open(imap_path, 'w') as f:
+                json.dump(identity_map, f, indent=1)
+            print(f"  Identity map saved to: {imap_path}")
+            print(f"  Fix an identity there (or --identity_map on re-run) and "
+                  f"the fix propagates through every frame of that fragment.")
+
     # Save ID list JSON for manual validation
     id_stats = []
     for cid in sorted(all_ids):
@@ -2420,6 +2492,7 @@ def run_player_tracking(
                                     REFEREE_CLASS_ID: 'referee'}.get(
                                         tracker1.dominant_class(cid), 'unknown'),
             "passed_filter":       bool(cid in good_ids),
+            "identity":            frag2pid.get(int(cid)),
             "player_name":         None,
             "team":                tracker1.id_team.get(cid),
         })
@@ -2428,15 +2501,29 @@ def run_player_tracking(
         json.dump({"ids": id_stats}, f, indent=2)
     if TRACK_DUMP:
         dump = {'fps': float(fps), 'width': int(video_info.width),
-                'height': int(video_info.height), 'tracks': []}
+                'height': int(video_info.height),
+                'start_frame': int(START_FRAME),
+                'team_sep': float(tracker1.team_sep),
+                'tracks': []}
         for cid, hist in tracker1.id_history.items():
             if len(hist) < 2:
                 continue
+            emb = tracker1.id_appearance.get(cid)
             dump['tracks'].append({
                 'id': int(cid),
                 'class': int(tracker1.dominant_class(cid) or PLAYER_CLASS_ID),
                 'frames': [int(h[0]) for h in hist],
                 'xy': [[round(h[1], 1), round(h[2], 1)] for h in hist],
+                # Box height per sample: the scale ruler for body-height
+                # normalised motion costs (offline identity assignment).
+                'h': [round(float(h[3]), 1) if len(h) > 3 else 0.0
+                      for h in hist],
+                'team': tracker1.id_team.get(cid),
+                'team_conf': tracker1.team_vote_frac.get(cid),
+                'stable': bool(cid in good_ids),
+                'appearance': (None if emb is None
+                               else [round(float(v), 5) for v in
+                                     np.asarray(emb).ravel()]),
             })
         dpath = output_path_for(source_video_path, 'track_dump')
         with open(dpath, 'w') as f:
@@ -2471,12 +2558,30 @@ def run_player_tracking(
     timeline = ball_timeline = {}
     if SHOW_MINIMAP:
         import minimap as mm
-        timeline = mm.build_timeline(
-            tracker1.id_history, fps,
-            id_team=tracker1.id_team,
-            id_class={c: tracker1.dominant_class(c)
-                      for c in tracker1.id_frame_count},
-            keep_ids=good_ids)
+        if frag2pid:
+            # Identity-level history: a player's fragments become one dot,
+            # and the gap filler bridges the joins between fragments.
+            pid_hist = defaultdict(list)
+            pid_team, pid_class = {}, {}
+            for cid, hist in tracker1.id_history.items():
+                pid = frag2pid.get(int(cid))
+                if pid is None:
+                    continue
+                pid_hist[pid].extend(hist)
+                if cid in tracker1.id_team and pid not in pid_team:
+                    pid_team[pid] = tracker1.id_team[cid]
+                pid_class.setdefault(pid, tracker1.dominant_class(cid))
+            for pid in pid_hist:
+                pid_hist[pid].sort()
+            timeline = mm.build_timeline(pid_hist, fps, id_team=pid_team,
+                                         id_class=pid_class, keep_ids=None)
+        else:
+            timeline = mm.build_timeline(
+                tracker1.id_history, fps,
+                id_team=tracker1.id_team,
+                id_class={c: tracker1.dominant_class(c)
+                          for c in tracker1.id_frame_count},
+                keep_ids=good_ids)
         ball_timeline = mm.build_ball_timeline(ball_history, fps)
         # Bounds from where players ACTUALLY went, not from the pitch polygon.
         # The polygon runs to the frame bottom because the near touchline is off
@@ -2533,7 +2638,17 @@ def run_player_tracking(
         # chains, so running it on both sides is safe.
         cid = apply_splits(cid, frame_no)
         cid = apply_remap(cid)
-        return apply_splits(cid, frame_no)
+        cid = apply_splits(cid, frame_no)
+        # Identity assignment: fragment -> player id (1..K). Unmapped
+        # fragments (none expected) keep their fragment id so nothing hides.
+        if frag2pid:
+            return frag2pid.get(int(cid), int(cid))
+        return cid
+
+    if frag2pid:
+        # In identity mode "stable" means assigned to a roster identity; the
+        # HUD's id count is the number of identities, not passed fragments.
+        good_ids = set(frag2pid.values())
 
     # ball_history frames were taken AFTER tracker1.update bumped frame_n.
     ball_by_frame = {int(f) - 1: (x, y) for f, x, y in ball_history}
@@ -3065,6 +3180,15 @@ if __name__ == '__main__':
     parser.add_argument('--track_dump', action='store_true',
         help='Save every id\'s per-frame position, for offline tracklet '
              'stitching with stitch_tracks.py.')
+    parser.add_argument('--no_assign', action='store_true',
+        help='Skip fragment -> identity assignment; render raw fragment ids.')
+    parser.add_argument('--identity_map', type=str, default=None,
+        help='Load a (hand-corrected) identity_map.json instead of computing '
+             'one. Fixes propagate through every frame of each fragment.')
+    parser.add_argument('--roster_min', type=int, default=None,
+        help='Identity assignment stops relaxing once the count is within '
+             'this roster band (default 22-26).')
+    parser.add_argument('--roster_max', type=int, default=None)
     parser.add_argument('--start_frame', type=int, default=None,
         help='Frame to start processing at. Use to skip warm-up — kickoff is '
              'often several minutes into a recording.')
@@ -3112,6 +3236,14 @@ if __name__ == '__main__':
         STITCH_KEEP_THIN = True
     if args.track_dump:
         TRACK_DUMP = True
+    if args.no_assign:
+        ASSIGN_IDENTITIES = False
+    if args.identity_map:
+        IDENTITY_MAP_PATH = args.identity_map
+    if args.roster_min is not None:
+        ASSIGN_ROSTER_MIN = args.roster_min
+    if args.roster_max is not None:
+        ASSIGN_ROSTER_MAX = args.roster_max
     if args.include_referees:
         INCLUDE_REFEREES = True
     if args.show_ball:
