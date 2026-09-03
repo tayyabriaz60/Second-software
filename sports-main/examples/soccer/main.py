@@ -2464,10 +2464,26 @@ def run_player_tracking(
                 cv2.putText(annotated, f'BALL {bc:.2f}', (cx-30, cy-r-8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
+        # Never hide a detected player. Earlier this dropped every detection
+        # whose id was not in good_ids, so anyone on a short fragment id (or
+        # an id that pass 2's tracker assigned differently from pass 1) simply
+        # vanished from the video and looked like a detection failure.
+        # Stable ids are drawn in colour with their number; the rest in grey.
+        unstable = None
+        n_detected = len(detections) if detections.tracker_id is not None else 0
         if detections.tracker_id is not None and len(detections) > 0:
-            # Keep only IDs that passed filters
             valid_mask = np.isin(detections.tracker_id, list(good_ids))
+            unstable   = detections[~valid_mask]
             detections = detections[valid_mask]
+
+        if unstable is not None and len(unstable) > 0 and focus_id is None:
+            for i in range(len(unstable)):
+                box = unstable.xyxy[i]
+                cx  = int((box[0]+box[2])/2)
+                bot = int(box[3])
+                cv2.ellipse(annotated, (cx, bot),
+                            (max(4, int((box[2]-box[0])/2)), 8),
+                            0, -45, 235, (170, 170, 170), 2)
 
         if detections.tracker_id is not None and len(detections) > 0:
             if focus_id is not None:
@@ -2510,10 +2526,11 @@ def run_player_tracking(
                     annotated, detections, labels=labels)
 
         # HUD counter
-        cv2.rectangle(annotated, (0, 0), (360, 36), (0, 0, 0), -1)
+        cv2.rectangle(annotated, (0, 0), (520, 36), (0, 0, 0), -1)
         n_visible = len(detections) if detections.tracker_id is not None else 0
         cv2.putText(annotated,
-                    f"Visible: {n_visible}  |  Unique IDs: {len(good_ids)}",
+                    f"Players: {n_detected}  |  Stable ID: {n_visible}  |  "
+                    f"IDs: {len(good_ids)}",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.65, (255, 255, 255), 1)
 
