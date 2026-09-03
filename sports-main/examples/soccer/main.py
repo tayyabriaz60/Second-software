@@ -1111,6 +1111,7 @@ class PlayerReIDTracker:
         self.id_crops:       defaultdict = defaultdict(list)   # cid -> [crop]
         self.id_team:        dict = {}
         self.id_splits:      dict = {}   # cid -> [(from_frame, new_cid), ...]
+        self.id_remap:       dict = {}   # stitched src cid -> dst cid
         self._claimed_this_frame: set = set()
         self._id_counter = 100000      # emergency only — see _assign_canonical
         self.id_embed_frame: dict = {}   # cid -> frame its embedding was taken
@@ -1970,6 +1971,8 @@ class PlayerReIDTracker:
         for raw, cid in list(self.id_map.items()):
             if cid in remap:
                 self.id_map[raw] = remap[cid]
+        # Pass 2 replays pass 1's per-frame ids and needs the same folding.
+        self.id_remap.update(remap)
         return n_applied, n_thin
 
     def weld_guard(self, fps: float) -> int:
@@ -2253,12 +2256,23 @@ def run_player_tracking(
             print(f"  min_frames capped {tracker1.min_frames} → {cap} "
                   f"(10% of --max_frames={max_frames})")
             tracker1.min_frames = cap
+    # Per-frame (online canonical id, box, class) so pass 2 can REPLAY pass 1
+    # instead of re-running detection + tracking. Re-running was never
+    # faithful: pass 2 skipped appearance ReID and ByteTrack re-seeded, so its
+    # ids diverged from pass 1's stable set and most players rendered grey.
+    frame_boxes: dict = {}
     for frame in tqdm(
         video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME),
         desc='Pass 1'
     ):
         raw = detect_raw(frame)
-        tracker1.update(get_player_detections(frame, raw), frame)
+        idx = tracker1.frame_n
+        det = tracker1.update(get_player_detections(frame, raw), frame)
+        if not no_render and det.tracker_id is not None and len(det):
+            frame_boxes[idx] = (
+                det.tracker_id.astype(np.int64).copy(),
+                det.xyxy.astype(np.float32).copy(),
+                None if det.class_id is None else det.class_id.copy())
         # Ball in pass 1 costs nothing now that detection is shared, and gives
         # the map a full trajectory to smooth rather than a strobing marker.
         if SHOW_BALL:
@@ -2387,17 +2401,11 @@ def run_player_tracking(
         return
 
     # ---- PASS 2: render output video (video read again from disk) ----
-    print("Pass 2: rendering output video...")
-    # Pass 2 only draws identities already decided in pass 1. Skip SigLIP /
-    # appearance ReID here — it re-downloads the vision tower, spams
-    # "Embedding extraction: 1it", and slows render 2–5x for no ID gain.
-    tracker2 = PlayerReIDTracker(
-        video_info.width, video_info.height, fps, device,
-        use_appearance=False)
-    # Seed the id_map so canonical IDs match pass 1 (ByteTrack is deterministic
-    # on the same detections). Do NOT seed last_seen — those frame indices are
-    # from the end of pass 1 and would break online ReID timing in pass 2.
-    tracker2.id_map = tracker1.id_map.copy()
+    # No detector, no tracker here: every box and id was recorded in pass 1
+    # and is replayed through the same split/stitch folding that produced the
+    # stats, so what is drawn is exactly what was measured.
+    print(f"Pass 2: rendering output video (replaying {len(frame_boxes)} "
+          f"frames of pass 1 identities, no re-detection)...")
 
     FOCUS_COLOUR = (0, 255, 128)
     trail        = []
@@ -2458,23 +2466,46 @@ def run_player_tracking(
             out = nxt
         return out
 
+    remap = dict(tracker1.id_remap)
+
+    def apply_remap(cid):
+        seen = set()
+        while cid in remap and cid not in seen:
+            seen.add(cid)
+            cid = remap[cid]
+        return cid
+
+    def final_id(cid, frame_no):
+        # Same order pass 1 applied: physics/efficiency cuts (pre-merge ids),
+        # stitched merge, then weld-guard cuts (post-merge ids). apply_splits
+        # chains, so running it on both sides is safe.
+        cid = apply_splits(cid, frame_no)
+        cid = apply_remap(cid)
+        return apply_splits(cid, frame_no)
+
+    # ball_history frames were taken AFTER tracker1.update bumped frame_n.
+    ball_by_frame = {int(f) - 1: (x, y) for f, x, y in ball_history}
+
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
-        raw        = detect_raw(frame)
-        detections = get_player_detections(frame, raw)
-        ball       = get_ball(frame, raw)
-        detections = tracker2.update(detections, frame)
-        if split_map and detections.tracker_id is not None and len(detections):
-            detections.tracker_id = np.array(
-                [apply_splits(int(t), tracker2.frame_n)
-                 for t in detections.tracker_id])
+        rec = frame_boxes.get(frame_n)
+        if rec is None:
+            detections = sv.Detections.empty()
+        else:
+            ids, xyxy, cls = rec
+            detections = sv.Detections(
+                xyxy=xyxy,
+                # annotators colour by class and reject class_id=None
+                class_id=(cls if cls is not None
+                          else np.full(len(ids), PLAYER_CLASS_ID, dtype=int)),
+                tracker_id=np.array([final_id(int(c), frame_n) for c in ids],
+                                    dtype=int))
         annotated  = frame.copy()
+        ball = ball_by_frame.get(frame_n)
         if ball is not None:
-            for bb, bc in zip(ball.xyxy, ball.confidence):
-                cx, cy = int((bb[0]+bb[2])/2), int((bb[1]+bb[3])/2)
-                r = max(10, int((bb[2]-bb[0])))
-                cv2.circle(annotated, (cx, cy), r, (0, 255, 255), 3)
-                cv2.putText(annotated, f'BALL {bc:.2f}', (cx-30, cy-r-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cx, cy = int(ball[0]), int(ball[1])
+            cv2.circle(annotated, (cx, cy - 8), 12, (0, 255, 255), 3)
+            cv2.putText(annotated, 'BALL', (cx-20, cy-28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # Never hide a detected player. Earlier this dropped every detection
         # whose id was not in good_ids, so anyone on a short fragment id (or
