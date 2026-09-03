@@ -292,6 +292,9 @@ BALL_STATIC_FRACTION = 0.25
 SPLIT_IMPLAUSIBLE = True
 
 SHOW_MINIMAP = True
+# Render players whose id is outside the roster set as grey ellipses without a
+# number (review mode). Default off: every player gets colour + id.
+GREY_UNSTABLE = False
 MINIMAP_CORNER = 'bottom_left'
 
 # Maximum plausible speed, in BODY HEIGHTS per second — scale-free, so it means
@@ -2534,10 +2537,17 @@ def run_player_tracking(
         # Stable ids are drawn in colour with their number; the rest in grey.
         unstable = None
         n_detected = len(detections) if detections.tracker_id is not None else 0
+        n_stable = 0
         if detections.tracker_id is not None and len(detections) > 0:
             valid_mask = np.isin(detections.tracker_id, list(good_ids))
-            unstable   = detections[~valid_mask]
-            detections = detections[valid_mask]
+            n_stable = int(valid_mask.sum())
+            if GREY_UNSTABLE:
+                # Review mode: only roster ids get colour + number.
+                unstable   = detections[~valid_mask]
+                detections = detections[valid_mask]
+            # Default: every tracked player gets colour + its id. An id switch
+            # then shows honestly as a number change instead of the player
+            # turning grey, which the client read as "not detected".
 
         if unstable is not None and len(unstable) > 0 and focus_id is None:
             for i in range(len(unstable)):
@@ -2590,9 +2600,8 @@ def run_player_tracking(
 
         # HUD counter
         cv2.rectangle(annotated, (0, 0), (520, 36), (0, 0, 0), -1)
-        n_visible = len(detections) if detections.tracker_id is not None else 0
         cv2.putText(annotated,
-                    f"Players: {n_detected}  |  Stable ID: {n_visible}  |  "
+                    f"Players: {n_detected}  |  Stable ID: {n_stable}  |  "
                     f"IDs: {len(good_ids)}",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.65, (255, 255, 255), 1)
@@ -3012,6 +3021,9 @@ if __name__ == '__main__':
              'game.mp4, 60 suits Improved_Ultrawide.')
     parser.add_argument('--no_minimap', action='store_true',
                         help='Hide the 2D player/ball map in the corner.')
+    parser.add_argument('--grey_unstable', action='store_true',
+                        help='Review mode: draw players outside the roster id '
+                             'set as grey ellipses without a number.')
     parser.add_argument('--minimap_corner', type=str, default=None,
                         choices=['bottom_left','bottom_right','top_left','top_right'],
                         help='Where to place the 2D map (default bottom_left).')
@@ -3059,6 +3071,8 @@ if __name__ == '__main__':
         help='Skip pass 2. All tracking stats come from pass 1, so this roughly '
              'halves a calibration run and writes no video.')
     args = parser.parse_args()
+    if args.grey_unstable:
+        GREY_UNSTABLE = True
     if args.no_minimap:
         SHOW_MINIMAP = False
     if args.minimap_corner:
