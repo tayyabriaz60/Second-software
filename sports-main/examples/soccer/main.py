@@ -40,6 +40,16 @@ class RobustVideoSink:
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or '.',
                     exist_ok=True)
         if shutil.which('ffmpeg'):
+            # 4K software x264 ran ~9 fps and became the pass-2 bottleneck once
+            # detection moved out of pass 2. Prefer the GPU encoder when the
+            # ffmpeg build has it; otherwise the fastest x264 preset.
+            encoder = self._pick_encoder()
+            if encoder == 'h264_nvenc':
+                enc_args = ['-c:v', 'h264_nvenc', '-preset', 'p4',
+                            '-rc', 'vbr', '-cq', '23', '-b:v', '0']
+            else:
+                enc_args = ['-c:v', 'libx264', '-preset', 'ultrafast',
+                            '-crf', '23']
             cmd = [
                 'ffmpeg', '-y', '-loglevel', 'error',
                 '-f', 'rawvideo', '-vcodec', 'rawvideo',
@@ -48,15 +58,14 @@ class RobustVideoSink:
                 '-r', str(self.fps),
                 '-i', '-',
                 '-an',
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                '-preset', 'veryfast', '-crf', '23',
+                *enc_args, '-pix_fmt', 'yuv420p',
                 '-movflags', '+faststart',
                 self.path,
             ]
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            print(f"Video writer: ffmpeg libx264 -> {self.path}")
+            print(f"Video writer: ffmpeg {encoder} -> {self.path}")
         else:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self._writer = cv2.VideoWriter(
@@ -66,6 +75,26 @@ class RobustVideoSink:
             print(f"Video writer: OpenCV mp4v -> {self.path} "
                   f"(install ffmpeg for safer output)")
         return self
+
+    @staticmethod
+    def _pick_encoder() -> str:
+        """h264_nvenc if this ffmpeg build lists it AND it actually opens."""
+        if os.environ.get('SOCCER_VIDEO_ENCODER'):
+            return os.environ['SOCCER_VIDEO_ENCODER']
+        try:
+            out = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'],
+                                 capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            return 'libx264'
+        if 'h264_nvenc' not in out:
+            return 'libx264'
+        # Listing the encoder is not enough: the driver may be missing.
+        probe = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+             '-i', 'color=black:s=256x256:r=1', '-frames:v', '1',
+             '-c:v', 'h264_nvenc', '-f', 'null', '-'],
+            capture_output=True, text=True, timeout=30)
+        return 'h264_nvenc' if probe.returncode == 0 else 'libx264'
 
     def write_frame(self, frame: np.ndarray) -> None:
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
