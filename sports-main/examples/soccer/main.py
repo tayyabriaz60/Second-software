@@ -2405,6 +2405,36 @@ def run_player_tracking(
               f"physics/weld cuts; emergency mints={tracker1.collision_mints})")
     print(f"  Valid IDs           : {sorted(good_ids)}")
 
+    # ---- Fragmentation metrics — computed every run, not by hand after ----
+    # These are pre-merge, Pass-1-level numbers: how many raw tracks the
+    # tracker minted, and how long each survived. This is the number that
+    # answers "did the code break" — the post-merge identity count does not,
+    # because a merger can turn 1,405 bad fragments into a tidy 43 and hide
+    # exactly the regression this is meant to catch.
+    frag_spans_s = []
+    for cid, hist in tracker1.id_history.items():
+        if len(hist) < 2:
+            continue
+        hist = sorted(hist)
+        frag_spans_s.append((hist[-1][0] - hist[0][0]) / fps)
+    clip_seconds = tracker1.frame_n / fps if fps else 0.0
+    frag_spans_arr = np.asarray(frag_spans_s, dtype=np.float64)
+    n_frags = len(frag_spans_arr)
+    pass1_metrics = {
+        'fragments':              n_frags,
+        'new_ids_per_sec':        round(n_frags / clip_seconds, 3) if clip_seconds else 0.0,
+        'median_span_s':          round(float(np.median(frag_spans_arr)), 2) if n_frags else 0.0,
+        'surviving_ge50pct':      int((frag_spans_arr >= 0.5 * clip_seconds).sum()) if clip_seconds and n_frags else 0,
+        'surviving_ge50pct_frac': round(float((frag_spans_arr >= 0.5 * clip_seconds).mean()), 3) if n_frags and clip_seconds else 0.0,
+        'clip_seconds':           round(clip_seconds, 1),
+    }
+    print(f"\nFragmentation metrics (pass 1, pre-merge):")
+    print(f"  fragments           : {pass1_metrics['fragments']}")
+    print(f"  new IDs/sec         : {pass1_metrics['new_ids_per_sec']}")
+    print(f"  median span (s)     : {pass1_metrics['median_span_s']}")
+    print(f"  surviving >=50% clip: {pass1_metrics['surviving_ge50pct']} "
+          f"({pass1_metrics['surviving_ge50pct_frac']:.0%})")
+
     if focus_id is not None and focus_id not in good_ids:
         print(f"  Warning: #{focus_id} didn't pass filters — showing anyway")
         good_ids.add(focus_id)
@@ -2449,14 +2479,15 @@ def run_player_tracking(
             if frags:
                 print(f"\nIdentity assignment ({len(frags)} fragments -> "
                       f"roster {ASSIGN_ROSTER_MIN}-{ASSIGN_ROSTER_MAX}):")
-                chains = ai.assign(frags, fps, float(tracker1.team_sep),
-                                   ASSIGN_ROSTER_MIN, ASSIGN_ROSTER_MAX)
+                chains, refused = ai.assign(frags, fps, float(tracker1.team_sep),
+                                            ASSIGN_ROSTER_MIN, ASSIGN_ROSTER_MAX)
                 total_frames = int(max(f.end for f in frags)) + 1
                 identity_map = ai.to_identity_map(
                     chains, fps, total_frames,
                     dict(roster_min=ASSIGN_ROSTER_MIN,
                          roster_max=ASSIGN_ROSTER_MAX,
-                         run_label=RUN_LABEL))
+                         run_label=RUN_LABEL),
+                    refused=refused)
                 frag2pid = {int(k): int(v) for k, v in
                             identity_map['fragment_to_identity'].items()}
                 s = identity_map['summary']
@@ -2464,8 +2495,16 @@ def run_player_tracking(
                       f"median={s['median_identity_s']}s  "
                       f">=60s: {s['identities_over_60s']}  "
                       f"links={s['total_links']} "
-                      f"(low-confidence {s['low_confidence_links']})")
+                      f"(low-confidence {s['low_confidence_links']})  "
+                      f"physics-refused={s['physics_refusals']}  "
+                      f"max path/net={s['max_path_net_ratio']}")
+                if s['identities_over_path_net_ceiling']:
+                    print(f"  WARNING: {s['identities_over_path_net_ceiling']} "
+                          f"identity(ies) still exceed the path/net ceiling "
+                          f"after the physics guard — likely welds; see "
+                          f"'identities' in identity_map.json for path_net_ratio.")
         if identity_map is not None:
+            identity_map.setdefault('summary', {})['pass1_metrics'] = pass1_metrics
             imap_path = output_path_for(source_video_path, 'identity_map')
             with open(imap_path, 'w') as f:
                 json.dump(identity_map, f, indent=1)
@@ -2498,7 +2537,7 @@ def run_player_tracking(
         })
     id_path = output_path_for(source_video_path, 'player_id_list')
     with open(id_path, 'w') as f:
-        json.dump({"ids": id_stats}, f, indent=2)
+        json.dump({"ids": id_stats, "run_metrics": pass1_metrics}, f, indent=2)
     if TRACK_DUMP:
         dump = {'fps': float(fps), 'width': int(video_info.width),
                 'height': int(video_info.height),

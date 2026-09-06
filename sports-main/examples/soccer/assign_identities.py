@@ -69,7 +69,12 @@ except ImportError:                                   # pragma: no cover
 SPRINT_BH_PER_SEC = 6.0        # ~10 m/s over a 1.75 m body
 JITTER_SLACK_BH = 1.5          # detection/box jitter at the two ends
 PREDICT_MAX_SECONDS = 0.8      # extrapolate exit velocity at most this far
-MAX_GAP_SECONDS = 90.0         # beyond this, position is uninformative
+# Tightened 90s -> 12s. Past a few seconds on a crowded pitch, "this fragment
+# reappeared somewhere reachable" stops discriminating the same player from a
+# team-mate who walked through the same spot — the reach budget below grows
+# with gap_s and was effectively unbounded at 90s (541 body-heights of slack).
+# The 101-fragment weld on v11 chained joins across exactly these long gaps.
+MAX_GAP_SECONDS = 12.0
 GAP_WEIGHT = 0.30              # cost for using the gap budget
 APPEARANCE_WEIGHT = 0.40       # cost per unit of (1 - cosine)
 TEAM_SOFT_PENALTY = 0.50
@@ -82,6 +87,19 @@ CONFIDENT_MARGIN = 0.35        # abs margin over runner-up for "confident"
 # Progressive acceptance thresholds. Pass 1 links only the obvious; later
 # passes relax while the identity count is above the roster band.
 THRESHOLDS = [0.35, 0.55, 0.75, 0.95, 1.15]
+
+# ---------------------------------------------------------- physics guard
+# main.py's Pass 1 already cuts welds twice (split_implausible_tracks: a
+# windowed body-height teleport check at MAX_BODY_HEIGHTS_PER_SEC=9.0;
+# weld_guard: the same check at a stricter 7.0, plus a whole-track path/net
+# ceiling of 25.0 behind WELD_GUARD_EFFICIENCY). Nothing re-checks the
+# MERGES this module makes afterwards, so a weld Pass 1 correctly cut apart
+# can be walked straight back together offline. These constants are the
+# SAME values, not a second tuned threshold, applied to the candidate
+# merged chain before it is committed instead of only to committed tracks.
+CHAIN_TELEPORT_BH_PER_SEC = 9.0   # == main.py MAX_BODY_HEIGHTS_PER_SEC
+CHAIN_SPEED_WINDOW_SECONDS = 0.20  # == main.py SPEED_WINDOW_SECONDS
+CHAIN_PATH_NET_CEILING = 25.0      # == main.py WELD_PATH_NET_CEILING
 
 
 @dataclass
@@ -178,6 +196,125 @@ def _cos(a, b) -> Optional[float]:
     return float(a @ b / (na * nb))
 
 
+def _smoothed_positions(xy: np.ndarray) -> np.ndarray:
+    """5-sample moving average, edge-padded.
+
+    Identical to the smoothing main.py's split_implausible_tracks / weld_guard
+    apply before differencing: raw box centres jitter by tens of pixels
+    frame to frame, and dividing that jitter by a short dt manufactures
+    impossible speeds. Ported verbatim, not re-derived.
+    """
+    if len(xy) < 5:
+        return xy
+    k = np.ones(5) / 5
+    pad = np.vstack([np.repeat(xy[:1], 2, axis=0), xy,
+                     np.repeat(xy[-1:], 2, axis=0)])
+    return np.stack([np.convolve(pad[:, 0], k, 'valid'),
+                      np.convolve(pad[:, 1], k, 'valid')], axis=1)
+
+
+def chain_teleport_check(
+        frags: List[Fragment], fps: float,
+        win_s: float = CHAIN_SPEED_WINDOW_SECONDS,
+        ceiling_bh_per_sec: float = CHAIN_TELEPORT_BH_PER_SEC
+) -> Optional[str]:
+    """Port of main.py's weld_guard() windowed body-height speed check,
+    applied to a CANDIDATE merged chain instead of an already-committed
+    track. None if the chain never exceeds the ceiling; else the reason.
+
+    Within one fragment, positions are smoothed before differencing exactly
+    as main.py does. Across a fragment boundary (always a real gap, by
+    cannot-link construction) the two raw endpoints are compared directly,
+    the same way main.py compares across a genuine tracking gap.
+    """
+    frags_sorted = sorted(frags, key=lambda f: f.start)
+    win = max(1, int(win_s * fps))
+    prev_frame = prev_pos = prev_h = None
+    for f in frags_sorted:
+        frames = f.frames.astype(float)
+        pos = f.xy.astype(float)
+        heights = f.h.astype(float)
+        pos_s = _smoothed_positions(pos)
+
+        if prev_frame is not None:
+            dt = (frames[0] - prev_frame) / fps
+            h_ref = prev_h if prev_h >= 8 else (heights[0] if heights[0] >= 8 else 0.0)
+            if dt > 0 and h_ref >= 8:
+                dist = float(np.hypot(pos[0][0] - prev_pos[0],
+                                      pos[0][1] - prev_pos[1]))
+                bh_per_sec = dist / h_ref / dt
+                if bh_per_sec > ceiling_bh_per_sec:
+                    return (f"teleport at join into frag {f.id}: "
+                            f"{bh_per_sec:.1f} bh/s > {ceiling_bh_per_sec}")
+
+        for i in range(1, len(frames)):
+            j = max(0, i - win)
+            if frames[i] - frames[j] < win * 0.5:
+                continue
+            dt = (frames[i] - frames[j]) / fps
+            if dt <= 0:
+                continue
+            h = max(float(np.mean(heights[j:i + 1])), 1e-6)
+            if h < 8:
+                continue
+            dist = float(np.hypot(pos_s[i][0] - pos_s[j][0],
+                                  pos_s[i][1] - pos_s[j][1]))
+            if dist / h / dt > ceiling_bh_per_sec:
+                return (f"teleport within frag {f.id}: "
+                        f"{dist / h / dt:.1f} bh/s > {ceiling_bh_per_sec}")
+
+        prev_frame = float(frames[-1])
+        prev_pos = pos[-1]
+        prev_h = float(heights[-1]) if heights[-1] > 0 else 0.0
+    return None
+
+
+def chain_path_net_ratio(frags: List[Fragment]) -> Tuple[float, float, float]:
+    """Same metric as main.py's path_net_ratio(): cumulative pixel path over
+    straight-line net displacement across the WHOLE candidate chain.
+
+    Both are in the same pixel units, so the ratio is scale-invariant on its
+    own (no body-height ruler needed) — matching main.py exactly, including
+    its edge case: with near-zero net displacement, the raw path is returned
+    instead of a ratio, so a player who wanders without going anywhere still
+    trips the same ceiling as an outright weld would.
+    """
+    frags_sorted = sorted(frags, key=lambda f: f.start)
+    path = 0.0
+    prev = None
+    for f in frags_sorted:
+        pts = f.xy.astype(float)
+        for a, b in zip(pts[:-1], pts[1:]):
+            path += float(np.hypot(b[0] - a[0], b[1] - a[1]))
+        if prev is not None:
+            path += float(np.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1]))
+        prev = pts[-1]
+    first = frags_sorted[0].xy[0].astype(float)
+    last = frags_sorted[-1].xy[-1].astype(float)
+    net = float(np.hypot(last[0] - first[0], last[1] - first[1]))
+    ratio = path if net < 1.0 else path / net
+    return path, net, ratio
+
+
+def physics_guard(frags: List[Fragment], fps: float) -> Optional[str]:
+    """None if a candidate merged chain is physically plausible; else why not.
+
+    Pass 1 (main.py) already cuts a weld apart on exactly this evidence
+    (split_implausible_tracks, weld_guard) before this module ever sees the
+    fragments. Without this guard, assign_identities was free to chain the
+    same weld straight back together, since nothing downstream re-validates
+    a merge — this closes that gap using the SAME thresholds Pass 1 uses,
+    not a re-tuned pair.
+    """
+    reason = chain_teleport_check(frags, fps)
+    if reason is not None:
+        return reason
+    _, net, ratio = chain_path_net_ratio(frags)
+    if ratio > CHAIN_PATH_NET_CEILING:
+        return f"path/net={ratio:.1f} > {CHAIN_PATH_NET_CEILING} (net={net:.0f}px)"
+    return None
+
+
 def link_cost(a: Fragment, b: Fragment, fps: float, hmodel, team_sep: float,
               max_gap_s: float = MAX_GAP_SECONDS) -> Optional[float]:
     """Cost that fragment b is the continuation of fragment a; None = impossible."""
@@ -246,8 +383,13 @@ class Chain:
 
 
 def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
-                  max_gap_s) -> int:
-    """One Hungarian round over chain tails x chain heads. Returns #links."""
+                  max_gap_s) -> Tuple[int, List[dict]]:
+    """One Hungarian round over chain tails x chain heads.
+
+    Returns (#links, refused) — refused is every candidate merge that would
+    have been accepted on cost alone but failed the physics_guard re-check
+    of the resulting combined chain.
+    """
     n = len(chains)
     BIG = 1e6
     C = np.full((n, n), BIG)
@@ -259,7 +401,7 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
             if c is not None:
                 C[i, j] = c
     if not np.isfinite(C[C < BIG]).any():
-        return 0
+        return 0, []
     if linear_sum_assignment is None:
         raise RuntimeError("scipy is required: pip install scipy")
     rows, cols = linear_sum_assignment(C)
@@ -289,19 +431,36 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
 
     used_tail, used_head = set(), set()
     merges = []
+    refused = []
     for c, margin, i, j in accepted:
         if i in used_tail or j in used_head:
             continue
         ri, rj = root(i), root(j)
         if ri == rj:
             continue
+        # Re-validate the CANDIDATE combined chain before committing — cost
+        # alone judges the join, not the resulting whole track. This is what
+        # was missing: Pass 1 cuts a weld apart on this same evidence, but
+        # nothing downstream re-checked what stitching it back together.
+        reason = physics_guard(chains[i].frags + chains[j].frags, fps)
+        if reason is not None:
+            refused.append({
+                'from': chains[i].tail.id, 'to': chains[j].head.id,
+                'cost': round(float(c), 3), 'threshold': threshold,
+                'reason': reason,
+            })
+            continue
         merges.append((i, j, c, margin))
         used_tail.add(i)
         used_head.add(j)
         parent[rj] = ri
 
+    for r in refused:
+        print(f"    physics guard REFUSED frag {r['from']} -> {r['to']} "
+              f"(cost {r['cost']}, thr {r['threshold']:.2f}): {r['reason']}")
+
     if not merges:
-        return 0
+        return 0, refused
     # Build merged chains in time order.
     groups: Dict[int, List[int]] = {}
     for k in range(n):
@@ -327,42 +486,56 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
             })
         new_chains.append(ch)
     chains[:] = new_chains
-    return len(merges)
+    return len(merges), refused
 
 
 def assign(frags: List[Fragment], fps: float, team_sep: float,
            roster_min: int = 22, roster_max: int = 26,
            max_gap_s: float = MAX_GAP_SECONDS,
-           thresholds=THRESHOLDS, verbose=True) -> List[Chain]:
+           thresholds=THRESHOLDS, verbose=True
+           ) -> Tuple[List[Chain], List[dict]]:
+    """Returns (chains, physics_refusals) — every merge the physics guard
+    blocked, in case the roster count still lands above target and the
+    right next step is reviewing refusals rather than loosening thresholds.
+    """
     hmodel = fit_height_model(frags)
     chains = [Chain([f]) for f in frags]
+    all_refused: List[dict] = []
     for t in thresholds:
         rounds = 0
         while True:
-            n_links = _assign_round(chains, fps, hmodel, team_sep, t, max_gap_s)
+            n_links, refused = _assign_round(chains, fps, hmodel, team_sep,
+                                             t, max_gap_s)
+            all_refused.extend(refused)
             rounds += 1
             if n_links == 0 or rounds > 50:
                 break
         if verbose:
-            print(f"  threshold {t:.2f}: {len(chains)} identities")
+            print(f"  threshold {t:.2f}: {len(chains)} identities  "
+                  f"({len(all_refused)} physics-refused so far)")
         if len(chains) <= roster_max:
             break
     chains.sort(key=lambda c: -sum(len(f.frames) for f in c.frags))
-    return chains
+    return chains, all_refused
 
 
-def summarise(chains: List[Chain], fps: float, total_frames: int) -> dict:
+def summarise(chains: List[Chain], fps: float, total_frames: int,
+             refused: Optional[List[dict]] = None) -> dict:
     durs = []
     covered = 0
     n_frag = 0
     low_conf = 0
+    ratios = []
     for ch in chains:
         fr = np.concatenate([f.frames for f in ch.frags])
         durs.append(len(np.unique(fr)) / fps)
         covered += len(np.unique(fr))
         n_frag += len(ch.frags)
         low_conf += sum(1 for l in ch.links if not l['confident'])
+        _, _, ratio = chain_path_net_ratio(ch.frags)
+        ratios.append(ratio)
     durs = np.asarray(durs)
+    ratios = np.asarray(ratios)
     return {
         'fragments': n_frag,
         'identities': len(chains),
@@ -372,22 +545,33 @@ def summarise(chains: List[Chain], fps: float, total_frames: int) -> dict:
         'low_confidence_links': low_conf,
         'total_links': sum(len(c.links) for c in chains),
         'clip_seconds': round(total_frames / fps, 1),
+        # Weld symptom: an identity chaining fragments across strangers has a
+        # high cumulative path over a small net displacement. Reported so a
+        # weld shows up in the summary instead of needing a manual dump scan.
+        'max_path_net_ratio': round(float(ratios.max()), 1) if len(ratios) else 0,
+        'identities_over_path_net_ceiling': int(
+            (ratios > CHAIN_PATH_NET_CEILING).sum()) if len(ratios) else 0,
+        'physics_refusals': len(refused or []),
     }
 
 
 def to_identity_map(chains: List[Chain], fps: float, total_frames: int,
-                    params: dict) -> dict:
+                    params: dict, refused: Optional[List[dict]] = None) -> dict:
     f2i, ids = {}, {}
     for pid, ch in enumerate(chains, start=1):
         fr = np.concatenate([f.frames for f in ch.frags])
         teams = [f.team for f in ch.frags if f.team is not None]
         team = (max(set(teams), key=teams.count) if teams else None)
+        path_px, net_px, ratio = chain_path_net_ratio(ch.frags)
         ids[str(pid)] = {
             'fragments': [f.id for f in ch.frags],
             'team': team,
             'first_frame': int(fr.min()), 'last_frame': int(fr.max()),
             'duration_s': round(len(np.unique(fr)) / fps, 1),
             'coverage': round(len(np.unique(fr)) / max(total_frames, 1), 3),
+            'path_px': round(path_px, 1),
+            'net_px': round(net_px, 1),
+            'path_net_ratio': round(ratio, 2),
             'links': ch.links,
             'player_name': None,
         }
@@ -396,7 +580,8 @@ def to_identity_map(chains: List[Chain], fps: float, total_frames: int,
     return {
         'fragment_to_identity': f2i,
         'identities': ids,
-        'summary': summarise(chains, fps, total_frames),
+        'summary': summarise(chains, fps, total_frames, refused),
+        'physics_refusals': refused or [],
         'params': params,
     }
 
@@ -457,20 +642,23 @@ def main():
     params = dict(roster_min=args.roster_min, roster_max=args.roster_max,
                   max_gap_s=args.max_gap_s, thresholds=THRESHOLDS,
                   sprint_bh_per_sec=SPRINT_BH_PER_SEC)
-    chains = assign(frags, fps, team_sep, args.roster_min, args.roster_max,
-                    args.max_gap_s)
-    imap = to_identity_map(chains, fps, total_frames, params)
+    chains, refused = assign(frags, fps, team_sep, args.roster_min,
+                             args.roster_max, args.max_gap_s)
+    imap = to_identity_map(chains, fps, total_frames, params, refused=refused)
     if args.apply:
         imap = apply_corrections(imap, json.load(open(args.apply)))
     s = imap['summary']
     print("\nAssignment summary")
     for k, v in s.items():
         print(f"  {k:24s}: {v}")
-    print("\nTop identities (duration s / fragments / low-conf links):")
+    print("\nTop identities (duration s / fragments / low-conf links / path/net):")
     for pid, rec in list(imap['identities'].items())[:30]:
         lc = sum(1 for l in rec.get('links', []) if not l.get('confident'))
+        flag = '  <-- WELD SUSPECT' if rec.get('path_net_ratio', 0) > CHAIN_PATH_NET_CEILING else ''
         print(f"  #{pid:>3} {rec.get('duration_s', 0):7.1f}s  "
-              f"{len(rec['fragments']):3d} frags  {lc} low-conf  team={rec.get('team')}")
+              f"{len(rec['fragments']):3d} frags  {lc} low-conf  "
+              f"path/net={rec.get('path_net_ratio', 0):6.1f}  "
+              f"team={rec.get('team')}{flag}")
     out = args.out or os.path.join(
         os.path.dirname(args.dump),
         os.path.basename(args.dump).replace('track_dump_', 'identity_map_'))
