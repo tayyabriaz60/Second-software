@@ -469,6 +469,19 @@ REID_DUEL_MIN_COSINE = 0.55    # stricter appearance in a duel
 # Soft rank weight among candidates that already passed hard gates.
 APPEARANCE_WEIGHT = 0.40
 
+# Whole-box SigLIP appearance ReID was ruled out on this footage, not just
+# unused: a 221-frame smoke test yielded 15 crops total (UMAP failed to fit
+# on that few), and the client's own notes have whole-box SigLIP splitting
+# kits 60 v 2. Both teams wear blue and differ in LIGHTNESS, not hue, so a
+# whole-box embedding is dominated by pitch, shadow and pose — the exact
+# failure team_colour.py's median-CIELAB-torso, per-tracklet vote was built
+# to fix (93% per-tracklet accuracy; see team_colour.py's own docstring).
+# Off by default so a container where torch/transformers happens to import
+# doesn't silently re-enable it and change online ReID behaviour between
+# runs. Turn back on only with evidence it beats CIELAB team colour on THIS
+# clip — see --appearance to override for a one-off comparison.
+USE_APPEARANCE_REID = False
+
 # Embedding every detection every frame would mean ~222k transformer passes on
 # a 2.4-minute clip. We only need one when deciding a NEW track's identity, or
 # to refresh a known track's signature occasionally.
@@ -2306,7 +2319,8 @@ def run_player_tracking(
 
     # ---- PASS 1: build lifetime stats (no frames stored in memory) ----
     print("Pass 1: building tracker lifetime stats...")
-    tracker1 = PlayerReIDTracker(video_info.width, video_info.height, fps, device)
+    tracker1 = PlayerReIDTracker(video_info.width, video_info.height, fps, device,
+                                 use_appearance=USE_APPEARANCE_REID)
     if max_frames:
         # Short calibration clips must not demand long continuous tracking.
         # 10% of the clip (min 2 frames) — 150 frames → min_frames=15.
@@ -3149,6 +3163,9 @@ def main(
           f"match: {TRACK_MATCHING_THRESHOLD}  "
           f"bt_lost: {BYTE_TRACK_LOST_SECONDS}s  "
           f"reid: {REID_WINDOW_SECONDS}s  "
+          f"min_frames: {MIN_SECONDS_TO_KEEP}s  "
+          f"reid_min_lost: {REID_MIN_LOST_FRAMES}f  "
+          f"appearance: {'on' if USE_APPEARANCE_REID else 'off (CIELAB team colour only)'}  "
           f"touchline buffer: {TOUCHLINE_BUFFER_PX}px")
 
     if max_frames:
@@ -3262,6 +3279,20 @@ if __name__ == '__main__':
     parser.add_argument('--no_render', action='store_true',
         help='Skip pass 2. All tracking stats come from pass 1, so this roughly '
              'halves a calibration run and writes no video.')
+    parser.add_argument('--appearance', action='store_true',
+        help='Force SigLIP appearance ReID on (off by default — ruled out on '
+             'this footage, see USE_APPEARANCE_REID). Only for a one-off '
+             'comparison against CIELAB team colour on the SAME clip.')
+    parser.add_argument('--baseline_v1_constants', action='store_true',
+        help='One-off test only, NOT a permanent revert: overrides '
+             'MIN_SECONDS_TO_KEEP=1.5, REID_MIN_LOST_FRAMES=3, '
+             'REID_WINDOW_SECONDS=5.0, TRACK_ACTIVATION_THRESHOLD=0.40, '
+             'TRACK_MATCHING_THRESHOLD=0.99, INFERENCE_CONF=0.25 (the v1 '
+             'baseline that produced 394 fragments on 18_08) so the same 10 '
+             'minutes of 14_08 can be re-run under those exact constants to '
+             'isolate whether v11 fragmentation came from the tuning '
+             'changes or the footage. Leaves every other constant, '
+             'including the assign_identities.py physics guard, untouched.')
     args = parser.parse_args()
     if args.grey_unstable:
         GREY_UNSTABLE = True
@@ -3325,6 +3356,20 @@ if __name__ == '__main__':
         TOUCHLINE_BUFFER_PX = args.touchline_buffer
     if args.run_label:
         RUN_LABEL = args.run_label
+    if args.appearance:
+        USE_APPEARANCE_REID = True
+    if args.baseline_v1_constants:
+        MIN_SECONDS_TO_KEEP = 1.5
+        REID_MIN_LOST_FRAMES = 3
+        REID_WINDOW_SECONDS = 5.0
+        TRACK_ACTIVATION_THRESHOLD = 0.40
+        TRACK_MATCHING_THRESHOLD = 0.99
+        if args.conf is None:
+            INFERENCE_CONF = 0.25
+        print(f"  --baseline_v1_constants: MIN_SECONDS_TO_KEEP=1.5  "
+              f"REID_MIN_LOST_FRAMES=3  REID_WINDOW_SECONDS=5.0  "
+              f"TRACK_ACTIVATION_THRESHOLD=0.40  TRACK_MATCHING_THRESHOLD=0.99  "
+              f"INFERENCE_CONF={INFERENCE_CONF}")
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
