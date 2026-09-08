@@ -3362,6 +3362,12 @@ if __name__ == '__main__':
              'isolate whether v11 fragmentation came from the tuning '
              'changes or the footage. Leaves every other constant, '
              'including the assign_identities.py physics guard, untouched.')
+    parser.add_argument('--path_net_ceiling', type=float, default=None,
+        help='Override WELD_PATH_NET_CEILING (default 25.0) for a sweep — '
+             'affects split_path_net_welds (pass 1, always on) and '
+             "weld_guard's dormant efficiency branch. 25 was measured to "
+             'over-cut a player who legitimately runs box-to-box repeatedly '
+             '(high path/net without being two people); try 50 / 75.')
     args = parser.parse_args()
     if args.grey_unstable:
         GREY_UNSTABLE = True
@@ -3439,6 +3445,9 @@ if __name__ == '__main__':
               f"REID_MIN_LOST_FRAMES=3  REID_WINDOW_SECONDS=5.0  "
               f"TRACK_ACTIVATION_THRESHOLD=0.40  TRACK_MATCHING_THRESHOLD=0.99  "
               f"INFERENCE_CONF={INFERENCE_CONF}")
+    if args.path_net_ceiling is not None:
+        WELD_PATH_NET_CEILING = args.path_net_ceiling
+        print(f"  --path_net_ceiling: WELD_PATH_NET_CEILING={WELD_PATH_NET_CEILING}")
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
