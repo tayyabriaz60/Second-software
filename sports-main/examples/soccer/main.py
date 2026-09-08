@@ -362,6 +362,15 @@ WELD_GUARD_EFFICIENCY = False
 # now applies to candidate merges (CHAIN_PATH_NET_CEILING), applied here
 # per fragment, before the dump / before the merger ever sees it.
 SPLIT_PATH_NET_WELDS = True
+# Minimum fragment duration before a path/net cut is even considered. A weld
+# needs TWO players and enough elapsed time to hand off between them — below
+# this, net displacement is tiny by construction (the player hasn't gone
+# anywhere yet) while every detection-jitter pixel still adds to path, so the
+# ratio blows up on NOISE, not on a second person. Measured on a 10-min run's
+# raw fragments: half (49.9%) are under 3s, where this was cutting legitimate
+# short tracks for a ratio that means nothing at that length. 20s is a real
+# floor, not a guess — sweep with --path_net_min_duration to confirm/adjust.
+SPLIT_PATH_NET_MIN_DURATION_S = 20.0
 
 TEAM_CROPS_PER_ID = 10
 TEAM_CROP_STRIDE = 8
@@ -2108,7 +2117,8 @@ class PlayerReIDTracker:
         splits += n_eff
         return splits
 
-    def split_path_net_welds(self, fps: float, ceiling: float = None) -> int:
+    def split_path_net_welds(self, fps: float, ceiling: float = None,
+                             min_duration_s: float = None) -> int:
         """Cut a fragment whose WHOLE-TRACK path/net ratio exceeds the
         ceiling, before it ever reaches the merger.
 
@@ -2125,25 +2135,44 @@ class PlayerReIDTracker:
         candidate MERGE (chain_path_net_ratio / CHAIN_PATH_NET_CEILING),
         applied here to a single fragment instead, at the same ceiling.
 
-        ceiling=None resolves to the current WELD_PATH_NET_CEILING global at
-        CALL time (module-level reassignment via --path_net_ceiling DOES
-        propagate here — verified; a `ceiling: float = WELD_PATH_NET_CEILING`
-        default would NOT, since defaults bind once at class-definition/
-        import time). Callers that need one flag to drive both this cut and
-        assign_identities.py's merge guard should still pass the value
-        explicitly — see the --path_net_ceiling wiring below.
+        min_duration_s gates the candidate itself, before the ratio is even
+        computed: a weld needs TWO players and enough elapsed time for a
+        hand-off between them, so a fragment shorter than that is not a
+        candidate no matter its ratio. Below ~SPLIT_PATH_NET_MIN_DURATION_S
+        (measured: half the raw fragments in a 10-min run are under 3s), net
+        displacement is tiny by construction (a player hasn't gone anywhere
+        yet) while every detection jitter pixel still adds to path — so the
+        ratio blows up on NOISE, not on a second player, and this check was
+        cutting legitimate short tracks for a number that means nothing at
+        that length.
+
+        ceiling=None / min_duration_s=None resolve to the current
+        WELD_PATH_NET_CEILING / SPLIT_PATH_NET_MIN_DURATION_S globals at
+        CALL time (module-level reassignment via --path_net_ceiling /
+        --path_net_min_duration DOES propagate here — verified; a default
+        bound directly to the global would NOT, since defaults evaluate
+        once at class-definition/import time). Callers that need one flag
+        to drive both this cut and assign_identities.py's merge guard
+        should still pass ceiling explicitly — see the CLI wiring below.
         """
         if ceiling is None:
             ceiling = WELD_PATH_NET_CEILING
+        if min_duration_s is None:
+            min_duration_s = SPLIT_PATH_NET_MIN_DURATION_S
         splits = 0
         for cid in list(self.id_history.keys()):
             # A cut can leave the remainder still welded; re-check cid until
-            # it's clean, too short, or has no real lateral excursion left.
+            # it's clean, too short, too brief, or has no real lateral
+            # excursion left. Re-checked EACH iteration, not once up front:
+            # a cut shrinks the remainder, which can itself drop below the
+            # duration floor and correctly stop being a candidate.
             for _ in range(10):
                 if self.path_net_ratio(cid) <= ceiling:
                     break
                 hist = sorted(self.id_history.get(cid, []))
                 if len(hist) < 4:
+                    break
+                if (hist[-1][0] - hist[0][0]) / fps < min_duration_s:
                     break
                 pos = np.array([[h[1], h[2]] for h in hist], dtype=float)
                 chord = pos[-1] - pos[0]
@@ -2471,9 +2500,12 @@ def run_player_tracking(
               f"(teleport>{WELD_TELEPORT_BODY_H_PER_SEC} bh/s or "
               f"path_net ceiling {WELD_PATH_NET_CEILING})")
     if SPLIT_PATH_NET_WELDS:
-        n_pn = tracker1.split_path_net_welds(fps, ceiling=WELD_PATH_NET_CEILING)
+        n_pn = tracker1.split_path_net_welds(
+            fps, ceiling=WELD_PATH_NET_CEILING,
+            min_duration_s=SPLIT_PATH_NET_MIN_DURATION_S)
         print(f"Path/net weld cut: {n_pn} cut(s) "
               f"(whole-track path_net > {WELD_PATH_NET_CEILING}, "
+              f"min duration {SPLIT_PATH_NET_MIN_DURATION_S}s, "
               f"catches slow drift welds neither weld_guard's windowed "
               f"teleport check nor its 3s rolling window sees)")
 
@@ -3385,6 +3417,20 @@ if __name__ == '__main__':
              'top of the run is provably what was used. 25 was measured to '
              'over-cut a player who legitimately runs box-to-box repeatedly '
              '(high path/net without being two people); try 50 / 75.')
+    parser.add_argument('--path_net_min_duration', type=float, default=None,
+        help='Override SPLIT_PATH_NET_MIN_DURATION_S (default 20.0): a '
+             'fragment shorter than this is never a path/net split '
+             'candidate, ratio or not. Below ~20s, net displacement is '
+             'small by construction and jitter alone can push the ratio '
+             'over the ceiling — measured cutting legitimate short tracks '
+             '(half of a 10-min run\'s raw fragments are under 3s). Sweep '
+             'with 10 / 20 / 30 against an EXISTING pre-cut dump using '
+             'tools/sweep_weld_gate.py rather than re-running detection.')
+    parser.add_argument('--no_path_net_split', action='store_true',
+        help='Disable split_path_net_welds for this run entirely (produces '
+             'a track dump with NO whole-track path/net cuts applied) — '
+             'for generating a clean baseline dump to sweep '
+             '--path_net_min_duration against offline afterward.')
     args = parser.parse_args()
     if args.grey_unstable:
         GREY_UNSTABLE = True
@@ -3467,6 +3513,13 @@ if __name__ == '__main__':
         print(f"  --path_net_ceiling: {WELD_PATH_NET_CEILING} "
               f"(passed explicitly to split_path_net_welds AND "
               f"assign_identities.assign — echoed again before each runs)")
+    if args.path_net_min_duration is not None:
+        SPLIT_PATH_NET_MIN_DURATION_S = args.path_net_min_duration
+        print(f"  --path_net_min_duration: {SPLIT_PATH_NET_MIN_DURATION_S}s")
+    if args.no_path_net_split:
+        SPLIT_PATH_NET_WELDS = False
+        print(f"  --no_path_net_split: split_path_net_welds disabled for "
+              f"this run (clean baseline dump)")
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
