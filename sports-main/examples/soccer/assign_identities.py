@@ -296,7 +296,9 @@ def chain_path_net_ratio(frags: List[Fragment]) -> Tuple[float, float, float]:
     return path, net, ratio
 
 
-def physics_guard(frags: List[Fragment], fps: float) -> Optional[str]:
+def physics_guard(frags: List[Fragment], fps: float,
+                  path_net_ceiling: float = CHAIN_PATH_NET_CEILING
+                  ) -> Optional[str]:
     """None if a candidate merged chain is physically plausible; else why not.
 
     Pass 1 (main.py) already cuts a weld apart on exactly this evidence
@@ -305,13 +307,20 @@ def physics_guard(frags: List[Fragment], fps: float) -> Optional[str]:
     same weld straight back together, since nothing downstream re-validates
     a merge — this closes that gap using the SAME thresholds Pass 1 uses,
     not a re-tuned pair.
+
+    path_net_ceiling is a real parameter, not a module-global read, on
+    purpose: main.py's --path_net_ceiling sweep passes it through explicitly
+    end to end (here and to split_path_net_welds) so one flag drives both
+    the pass-1 cut and this merge guard, and a run's printed ceiling is
+    provably the one actually used rather than an assumption about global
+    propagation across two files.
     """
     reason = chain_teleport_check(frags, fps)
     if reason is not None:
         return reason
     _, net, ratio = chain_path_net_ratio(frags)
-    if ratio > CHAIN_PATH_NET_CEILING:
-        return f"path/net={ratio:.1f} > {CHAIN_PATH_NET_CEILING} (net={net:.0f}px)"
+    if ratio > path_net_ceiling:
+        return f"path/net={ratio:.1f} > {path_net_ceiling} (net={net:.0f}px)"
     return None
 
 
@@ -383,7 +392,8 @@ class Chain:
 
 
 def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
-                  max_gap_s) -> Tuple[int, List[dict]]:
+                  max_gap_s, path_net_ceiling: float = CHAIN_PATH_NET_CEILING
+                  ) -> Tuple[int, List[dict]]:
     """One Hungarian round over chain tails x chain heads.
 
     Returns (#links, refused) — refused is every candidate merge that would
@@ -442,7 +452,8 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
         # alone judges the join, not the resulting whole track. This is what
         # was missing: Pass 1 cuts a weld apart on this same evidence, but
         # nothing downstream re-checked what stitching it back together.
-        reason = physics_guard(chains[i].frags + chains[j].frags, fps)
+        reason = physics_guard(chains[i].frags + chains[j].frags, fps,
+                               path_net_ceiling)
         if reason is not None:
             refused.append({
                 'from': chains[i].tail.id, 'to': chains[j].head.id,
@@ -492,7 +503,8 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
 def assign(frags: List[Fragment], fps: float, team_sep: float,
            roster_min: int = 22, roster_max: int = 26,
            max_gap_s: float = MAX_GAP_SECONDS,
-           thresholds=THRESHOLDS, verbose=True
+           thresholds=THRESHOLDS, verbose=True,
+           path_net_ceiling: float = CHAIN_PATH_NET_CEILING
            ) -> Tuple[List[Chain], List[dict]]:
     """Returns (chains, physics_refusals) — every merge the physics guard
     blocked, in case the roster count still lands above target and the
@@ -505,7 +517,7 @@ def assign(frags: List[Fragment], fps: float, team_sep: float,
         rounds = 0
         while True:
             n_links, refused = _assign_round(chains, fps, hmodel, team_sep,
-                                             t, max_gap_s)
+                                             t, max_gap_s, path_net_ceiling)
             all_refused.extend(refused)
             rounds += 1
             if n_links == 0 or rounds > 50:
@@ -520,7 +532,8 @@ def assign(frags: List[Fragment], fps: float, team_sep: float,
 
 
 def summarise(chains: List[Chain], fps: float, total_frames: int,
-             refused: Optional[List[dict]] = None) -> dict:
+             refused: Optional[List[dict]] = None,
+             path_net_ceiling: float = CHAIN_PATH_NET_CEILING) -> dict:
     durs = []
     covered = 0
     n_frag = 0
@@ -549,14 +562,16 @@ def summarise(chains: List[Chain], fps: float, total_frames: int,
         # high cumulative path over a small net displacement. Reported so a
         # weld shows up in the summary instead of needing a manual dump scan.
         'max_path_net_ratio': round(float(ratios.max()), 1) if len(ratios) else 0,
+        'path_net_ceiling_used': path_net_ceiling,
         'identities_over_path_net_ceiling': int(
-            (ratios > CHAIN_PATH_NET_CEILING).sum()) if len(ratios) else 0,
+            (ratios > path_net_ceiling).sum()) if len(ratios) else 0,
         'physics_refusals': len(refused or []),
     }
 
 
 def to_identity_map(chains: List[Chain], fps: float, total_frames: int,
-                    params: dict, refused: Optional[List[dict]] = None) -> dict:
+                    params: dict, refused: Optional[List[dict]] = None,
+                    path_net_ceiling: float = CHAIN_PATH_NET_CEILING) -> dict:
     f2i, ids = {}, {}
     for pid, ch in enumerate(chains, start=1):
         fr = np.concatenate([f.frames for f in ch.frags])
@@ -580,7 +595,8 @@ def to_identity_map(chains: List[Chain], fps: float, total_frames: int,
     return {
         'fragment_to_identity': f2i,
         'identities': ids,
-        'summary': summarise(chains, fps, total_frames, refused),
+        'summary': summarise(chains, fps, total_frames, refused,
+                             path_net_ceiling),
         'physics_refusals': refused or [],
         'params': params,
     }
@@ -628,6 +644,13 @@ def main():
     ap.add_argument('--roster_min', type=int, default=22)
     ap.add_argument('--roster_max', type=int, default=26)
     ap.add_argument('--max_gap_s', type=float, default=MAX_GAP_SECONDS)
+    ap.add_argument('--path_net_ceiling', type=float, default=CHAIN_PATH_NET_CEILING,
+                    help='Override CHAIN_PATH_NET_CEILING (default 25.0) for a '
+                         'sweep. For a ceiling sweep against an EXISTING dump: '
+                         'pass-1 fragment count and median span are fixed by '
+                         'the dump and will not change between runs — only '
+                         'merger-stage numbers (merges/refusals, identity '
+                         'count, identities_over_path_net_ceiling) respond.')
     ap.add_argument('--apply', default=None,
                     help='corrections JSON to apply on top of the automatic map')
     args = ap.parse_args()
@@ -639,12 +662,17 @@ def main():
           f"{total_frames / fps:.0f}s of footage, team_sep={team_sep:.2f}, "
           f"heights={'yes' if any((f.h > 0).any() for f in frags) else 'NO (y-model fallback)'}, "
           f"appearance={'yes' if any(f.appearance is not None for f in frags) else 'no'}")
+    print(f"path_net_ceiling in use: {args.path_net_ceiling}"
+          f"{'  (default)' if args.path_net_ceiling == CHAIN_PATH_NET_CEILING else '  (OVERRIDDEN)'}")
     params = dict(roster_min=args.roster_min, roster_max=args.roster_max,
                   max_gap_s=args.max_gap_s, thresholds=THRESHOLDS,
-                  sprint_bh_per_sec=SPRINT_BH_PER_SEC)
+                  sprint_bh_per_sec=SPRINT_BH_PER_SEC,
+                  path_net_ceiling=args.path_net_ceiling)
     chains, refused = assign(frags, fps, team_sep, args.roster_min,
-                             args.roster_max, args.max_gap_s)
-    imap = to_identity_map(chains, fps, total_frames, params, refused=refused)
+                             args.roster_max, args.max_gap_s,
+                             path_net_ceiling=args.path_net_ceiling)
+    imap = to_identity_map(chains, fps, total_frames, params, refused=refused,
+                           path_net_ceiling=args.path_net_ceiling)
     if args.apply:
         imap = apply_corrections(imap, json.load(open(args.apply)))
     s = imap['summary']
@@ -654,7 +682,7 @@ def main():
     print("\nTop identities (duration s / fragments / low-conf links / path/net):")
     for pid, rec in list(imap['identities'].items())[:30]:
         lc = sum(1 for l in rec.get('links', []) if not l.get('confident'))
-        flag = '  <-- WELD SUSPECT' if rec.get('path_net_ratio', 0) > CHAIN_PATH_NET_CEILING else ''
+        flag = '  <-- WELD SUSPECT' if rec.get('path_net_ratio', 0) > args.path_net_ceiling else ''
         print(f"  #{pid:>3} {rec.get('duration_s', 0):7.1f}s  "
               f"{len(rec['fragments']):3d} frags  {lc} low-conf  "
               f"path/net={rec.get('path_net_ratio', 0):6.1f}  "

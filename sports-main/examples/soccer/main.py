@@ -2108,7 +2108,7 @@ class PlayerReIDTracker:
         splits += n_eff
         return splits
 
-    def split_path_net_welds(self, fps: float) -> int:
+    def split_path_net_welds(self, fps: float, ceiling: float = None) -> int:
         """Cut a fragment whose WHOLE-TRACK path/net ratio exceeds the
         ceiling, before it ever reaches the merger.
 
@@ -2124,13 +2124,23 @@ class PlayerReIDTracker:
         whole-chain check assign_identities.py now applies to every
         candidate MERGE (chain_path_net_ratio / CHAIN_PATH_NET_CEILING),
         applied here to a single fragment instead, at the same ceiling.
+
+        ceiling=None resolves to the current WELD_PATH_NET_CEILING global at
+        CALL time (module-level reassignment via --path_net_ceiling DOES
+        propagate here — verified; a `ceiling: float = WELD_PATH_NET_CEILING`
+        default would NOT, since defaults bind once at class-definition/
+        import time). Callers that need one flag to drive both this cut and
+        assign_identities.py's merge guard should still pass the value
+        explicitly — see the --path_net_ceiling wiring below.
         """
+        if ceiling is None:
+            ceiling = WELD_PATH_NET_CEILING
         splits = 0
         for cid in list(self.id_history.keys()):
             # A cut can leave the remainder still welded; re-check cid until
             # it's clean, too short, or has no real lateral excursion left.
             for _ in range(10):
-                if self.path_net_ratio(cid) <= WELD_PATH_NET_CEILING:
+                if self.path_net_ratio(cid) <= ceiling:
                     break
                 hist = sorted(self.id_history.get(cid, []))
                 if len(hist) < 4:
@@ -2461,7 +2471,7 @@ def run_player_tracking(
               f"(teleport>{WELD_TELEPORT_BODY_H_PER_SEC} bh/s or "
               f"path_net ceiling {WELD_PATH_NET_CEILING})")
     if SPLIT_PATH_NET_WELDS:
-        n_pn = tracker1.split_path_net_welds(fps)
+        n_pn = tracker1.split_path_net_welds(fps, ceiling=WELD_PATH_NET_CEILING)
         print(f"Path/net weld cut: {n_pn} cut(s) "
               f"(whole-track path_net > {WELD_PATH_NET_CEILING}, "
               f"catches slow drift welds neither weld_guard's windowed "
@@ -2561,16 +2571,20 @@ def run_player_tracking(
             frags.sort(key=lambda f: f.start)
             if frags:
                 print(f"\nIdentity assignment ({len(frags)} fragments -> "
-                      f"roster {ASSIGN_ROSTER_MIN}-{ASSIGN_ROSTER_MAX}):")
+                      f"roster {ASSIGN_ROSTER_MIN}-{ASSIGN_ROSTER_MAX}, "
+                      f"path_net_ceiling={WELD_PATH_NET_CEILING}):")
                 chains, refused = ai.assign(frags, fps, float(tracker1.team_sep),
-                                            ASSIGN_ROSTER_MIN, ASSIGN_ROSTER_MAX)
+                                            ASSIGN_ROSTER_MIN, ASSIGN_ROSTER_MAX,
+                                            path_net_ceiling=WELD_PATH_NET_CEILING)
                 total_frames = int(max(f.end for f in frags)) + 1
                 identity_map = ai.to_identity_map(
                     chains, fps, total_frames,
                     dict(roster_min=ASSIGN_ROSTER_MIN,
                          roster_max=ASSIGN_ROSTER_MAX,
-                         run_label=RUN_LABEL),
-                    refused=refused)
+                         run_label=RUN_LABEL,
+                         path_net_ceiling=WELD_PATH_NET_CEILING),
+                    refused=refused,
+                    path_net_ceiling=WELD_PATH_NET_CEILING)
                 frag2pid = {int(k): int(v) for k, v in
                             identity_map['fragment_to_identity'].items()}
                 s = identity_map['summary']
@@ -3363,9 +3377,12 @@ if __name__ == '__main__':
              'changes or the footage. Leaves every other constant, '
              'including the assign_identities.py physics guard, untouched.')
     parser.add_argument('--path_net_ceiling', type=float, default=None,
-        help='Override WELD_PATH_NET_CEILING (default 25.0) for a sweep — '
-             'affects split_path_net_welds (pass 1, always on) and '
-             "weld_guard's dormant efficiency branch. 25 was measured to "
+        help='Override the whole-track path/net ceiling for a sweep '
+             '(default 25.0). Threaded explicitly into BOTH consumers — '
+             'split_path_net_welds (pass 1) and assign_identities.assign '
+             "(the merge guard) — not two separately-set globals, so one "
+             'flag value drives both stages and the printed value at the '
+             'top of the run is provably what was used. 25 was measured to '
              'over-cut a player who legitimately runs box-to-box repeatedly '
              '(high path/net without being two people); try 50 / 75.')
     args = parser.parse_args()
@@ -3447,7 +3464,9 @@ if __name__ == '__main__':
               f"INFERENCE_CONF={INFERENCE_CONF}")
     if args.path_net_ceiling is not None:
         WELD_PATH_NET_CEILING = args.path_net_ceiling
-        print(f"  --path_net_ceiling: WELD_PATH_NET_CEILING={WELD_PATH_NET_CEILING}")
+        print(f"  --path_net_ceiling: {WELD_PATH_NET_CEILING} "
+              f"(passed explicitly to split_path_net_welds AND "
+              f"assign_identities.assign — echoed again before each runs)")
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
