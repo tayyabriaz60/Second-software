@@ -353,6 +353,15 @@ WELD_TELEPORT_BODY_H_PER_SEC = 7.0  # stricter than general physics cut
 # inside every 3 s window (path 100px, net 10px → ratio 10 > 8), so the test
 # fires on ordinary play, not on welds. Teleport cuts above stay on.
 WELD_GUARD_EFFICIENCY = False
+# Whole-TRACK path/net check (split_path_net_welds), not a rolling window.
+# Safe to leave on where WELD_GUARD_EFFICIENCY is not: an ordinary 3s
+# stop-and-turn (path 100px, net 10px -> ratio 10) is what made the ROLLING
+# check above misfire on ordinary play, but it never gets near this
+# ceiling (25) once averaged over a whole fragment's span — a real weld
+# (id 16: path/net=694 over 184s) does. Same ceiling assign_identities.py
+# now applies to candidate merges (CHAIN_PATH_NET_CEILING), applied here
+# per fragment, before the dump / before the merger ever sees it.
+SPLIT_PATH_NET_WELDS = True
 
 TEAM_CROPS_PER_ID = 10
 TEAM_CROP_STRIDE = 8
@@ -2099,6 +2108,60 @@ class PlayerReIDTracker:
         splits += n_eff
         return splits
 
+    def split_path_net_welds(self, fps: float) -> int:
+        """Cut a fragment whose WHOLE-TRACK path/net ratio exceeds the
+        ceiling, before it ever reaches the merger.
+
+        Neither existing cut sees this case. The windowed teleport check
+        (this method, split_implausible_tracks) only fires on a single fast
+        hop. split_inefficient_tracks only looks inside a 3-second rolling
+        window (EFFICIENCY_WINDOW_SECONDS), and is gated off by default
+        besides (SPLIT_INEFFICIENT / WELD_GUARD_EFFICIENCY both False). A
+        weld that develops as a slow drift across the fragment's WHOLE span
+        — not a one-hop teleport, not a zigzag inside any single 3s window —
+        is invisible to both, which is how a 184s, path/net=694 fragment
+        (real case: id 16) survived pass 1 intact. This is the same
+        whole-chain check assign_identities.py now applies to every
+        candidate MERGE (chain_path_net_ratio / CHAIN_PATH_NET_CEILING),
+        applied here to a single fragment instead, at the same ceiling.
+        """
+        splits = 0
+        for cid in list(self.id_history.keys()):
+            # A cut can leave the remainder still welded; re-check cid until
+            # it's clean, too short, or has no real lateral excursion left.
+            for _ in range(10):
+                if self.path_net_ratio(cid) <= WELD_PATH_NET_CEILING:
+                    break
+                hist = sorted(self.id_history.get(cid, []))
+                if len(hist) < 4:
+                    break
+                pos = np.array([[h[1], h[2]] for h in hist], dtype=float)
+                chord = pos[-1] - pos[0]
+                # Floor only, no skip: a ping-pong weld (id bounces between
+                # two far-apart players and happens to end back near its
+                # start) has near-zero net too, and IS exactly what this
+                # check must catch — path_net_ratio() itself does not exempt
+                # that case (net<1.0 returns the raw, large path as the
+                # ratio), so neither does the cut search. A ~random unit
+                # vector from a tiny chord still finds the point farthest
+                # from pos[0], which is the real hand-off for that shape.
+                chord_len = float(np.linalg.norm(chord)) + 1e-6
+                unit = chord / chord_len
+                best_k, best_d = 1, -1.0
+                for k in range(1, len(pos) - 1):
+                    rel = pos[k] - pos[0]
+                    proj = min(max(float(rel @ unit), 0.0), chord_len)
+                    perp = float(np.linalg.norm(rel - proj * unit))
+                    if perp > best_d:
+                        best_d, best_k = perp, k
+                if best_d < 25.0:
+                    break   # jitter on a line, not a real hand-off excursion
+                n = self._apply_track_cuts(cid, hist, [best_k])
+                if n == 0:
+                    break
+                splits += n
+        return splits
+
     def valid_ids(self) -> set:
         """Client roster filter: clean long tracks in the 24–40 band.
 
@@ -2397,6 +2460,12 @@ def run_player_tracking(
         print(f"\nWeld guard: {n_weld} cut(s) "
               f"(teleport>{WELD_TELEPORT_BODY_H_PER_SEC} bh/s or "
               f"path_net ceiling {WELD_PATH_NET_CEILING})")
+    if SPLIT_PATH_NET_WELDS:
+        n_pn = tracker1.split_path_net_welds(fps)
+        print(f"Path/net weld cut: {n_pn} cut(s) "
+              f"(whole-track path_net > {WELD_PATH_NET_CEILING}, "
+              f"catches slow drift welds neither weld_guard's windowed "
+              f"teleport check nor its 3s rolling window sees)")
 
     good_ids = tracker1.valid_ids()
     all_ids  = set(tracker1.id_frame_count.keys())
