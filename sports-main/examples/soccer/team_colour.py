@@ -160,7 +160,10 @@ def team_hard_conflict(
         sep_min: float = TEAM_HARD_SEP_MIN,
         vote_min: float = TEAM_HARD_VOTE_FRAC,
 ) -> bool:
-    """True when opposing team labels should HARD-VETO a stitch/re-id link."""
+    """Legacy helper — hard vetoes are disabled in stitch/assign (measured worse).
+
+    Kept for experiments only. Production paths use team_penalty() instead.
+    """
     if team_a is None or team_b is None or team_a == team_b:
         return False
     if separation < sep_min:

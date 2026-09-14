@@ -1,4 +1,5 @@
 import argparse
+import csv
 import itertools
 import json
 import os
@@ -402,12 +403,6 @@ REID_VELOCITY_DECAY = 0.88
 # Online CIELAB L-gap above which a lost-track candidate is rejected as the
 # wrong team (navy vs sky-blue kits). Below this, colour is ignored online.
 TEAM_LAB_HARD_DELTA = 28.0
-# When offline team separation is strong enough, opposing labels HARD-VETO a
-# stitch link (not just a soft penalty). Below this, keep soft penalty only —
-# 93% colour accuracy is too weak for a blanket veto.
-TEAM_HARD_SEP_MIN = 1.35
-TEAM_HARD_VOTE_FRAC = 0.70
-
 # Fold offline-stitched fragments into single identities after pass 1.
 STITCH = True
 # Thin stitch links measured ~29% correct — never apply them for v6.
@@ -432,7 +427,7 @@ INCLUDE_REFEREES = False
 # Draw the ball. RF-DETR detects it as a class (~58% of frames on the 14_09
 # stationary, ~21px, confidence 0.36-0.50), which is enough for a trajectory
 # once gaps are interpolated — it does not need the follow-cam.
-SHOW_BALL = False
+SHOW_BALL = True
 
 # Skip this many frames before processing. Recordings often start well before
 # kickoff — the 14_09 stationary has 8 minutes of warm-up, where extra balls and
@@ -666,6 +661,34 @@ def video_frames(source_video_path: str, stride: int = 1, max_frames: int = None
     return itertools.islice(gen, max_frames) if max_frames else gen
 
 
+def iter_tracking_frames(source_video_path: str, max_frames: int = None,
+                         start_frame: int = 0, fallback_fps: float = 30.0):
+    """Yield (clip_frame_idx, container_seconds, frame) for pass-1 tracking.
+
+    Uses the container clock (POS_MSEC) when available so CSV exports stay
+    correct on variable-frame-rate footage; falls back to index / fps.
+    """
+    cap = cv2.VideoCapture(source_video_path)
+    try:
+        for _ in range(int(start_frame)):
+            if not cap.grab():
+                return
+        idx = 0
+        while max_frames is None or idx < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if t_ms and t_ms > 0:
+                t_sec = float(t_ms) / 1000.0
+            else:
+                t_sec = (start_frame + idx) / fallback_fps
+            yield idx, t_sec, frame
+            idx += 1
+    finally:
+        cap.release()
+
+
 # Set from --run_label, or defaults to mot_sota_v6 for the identification push.
 RUN_LABEL = 'mot_sota_v6'
 
@@ -682,6 +705,168 @@ def output_path_for(source_video_path: str, suffix: str) -> str:
     out_dir = os.path.join(PARENT_DIR, 'data', 'id_lists')
     os.makedirs(out_dir, exist_ok=True)
     return os.path.join(out_dir, f'{suffix}_{stem}_{label}.json')
+
+
+def output_csv_path_for(source_video_path: str, suffix: str) -> str:
+    return output_path_for(source_video_path, suffix).replace('.json', '.csv')
+
+
+def identity_teams_from_map(identity_map: Optional[dict]) -> dict:
+    """Per-identity majority team from identity_map (not first fragment)."""
+    if not identity_map:
+        return {}
+    out = {}
+    for pid, rec in identity_map.get('identities', {}).items():
+        team = rec.get('team')
+        if team is not None:
+            out[int(pid)] = int(team)
+    return out
+
+
+def write_warehouse_csvs(source_video_path: str, fps: float,
+                         frame_seconds: dict, identity_map: Optional[dict],
+                         frag2pid: dict, tracker1, ball_history: list) -> dict:
+    """Flat CSV exports for warehouse ingest — seconds, pixels, honest units."""
+    import minimap as mm
+
+    def _sec(frame_idx: int) -> float:
+        return round(float(frame_seconds.get(int(frame_idx),
+                                             int(frame_idx) / fps)), 3)
+
+    paths = {}
+    id_teams = identity_teams_from_map(identity_map)
+
+    # ---- players.csv ----
+    player_rows = []
+    if identity_map and identity_map.get('identities'):
+        for pid, rec in identity_map['identities'].items():
+            ff = int(rec.get('first_frame', 0))
+            lf = int(rec.get('last_frame', ff))
+            dur = float(rec.get('duration_s', 0.0))
+            path_px = float(rec.get('path_px', 0.0))
+            frag_frames = set()
+            for frag in rec.get('fragments', []):
+                for h in tracker1.id_history.get(int(frag), []):
+                    frag_frames.add(int(h[0]))
+            frames_seen = len(frag_frames) or int(round(dur * fps))
+            mean_speed = path_px / max(dur, 1e-6)
+            player_rows.append({
+                'identity_id': int(pid),
+                'team': id_teams.get(int(pid), rec.get('team')),
+                'first_s': _sec(ff),
+                'last_s': _sec(lf),
+                'duration_s': round(dur, 3),
+                'frames_seen': frames_seen,
+                'distance_px': round(path_px, 1),
+                'mean_speed_px_s': round(mean_speed, 1),
+                'path_net_ratio': rec.get('path_net_ratio', ''),
+            })
+    else:
+        for cid in sorted(tracker1.id_frame_count.keys()):
+            hist = tracker1.id_history.get(cid) or []
+            if len(hist) < 2:
+                continue
+            hist = sorted(hist)
+            ff, lf = int(hist[0][0]), int(hist[-1][0])
+            dur = (lf - ff + 1) / fps
+            path_px = float(tracker1.id_path_px[cid])
+            player_rows.append({
+                'identity_id': int(frag2pid.get(int(cid), int(cid))),
+                'team': tracker1.id_team.get(cid),
+                'first_s': _sec(ff),
+                'last_s': _sec(lf),
+                'duration_s': round(dur, 3),
+                'frames_seen': int(tracker1.id_frame_count[cid]),
+                'distance_px': round(path_px, 1),
+                'mean_speed_px_s': round(path_px / max(dur, 1e-6), 1),
+                'path_net_ratio': round(tracker1.path_net_ratio(cid), 2),
+            })
+
+    ppath = output_csv_path_for(source_video_path, 'players')
+    with open(ppath, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=[
+            'identity_id', 'team', 'first_s', 'last_s', 'duration_s',
+            'frames_seen', 'distance_px', 'mean_speed_px_s', 'path_net_ratio'])
+        w.writeheader()
+        w.writerows(player_rows)
+    paths['players'] = ppath
+
+    # ---- positions.csv ----
+    pid_hist = defaultdict(list)
+    height_at = {}
+    if frag2pid:
+        for cid, hist in tracker1.id_history.items():
+            pid = frag2pid.get(int(cid))
+            if pid is None:
+                continue
+            pid_hist[pid].extend(hist)
+            for h in hist:
+                height_at[(int(pid), int(h[0]))] = (
+                    round(float(h[3]), 1) if len(h) > 3 else '')
+    else:
+        for cid, hist in tracker1.id_history.items():
+            if len(hist) < 2:
+                continue
+            pid_hist[int(cid)].extend(hist)
+            for h in hist:
+                height_at[(int(cid), int(h[0]))] = (
+                    round(float(h[3]), 1) if len(h) > 3 else '')
+
+    for pid in pid_hist:
+        pid_hist[pid].sort(key=lambda h: h[0])
+
+    timeline = mm.build_timeline(
+        pid_hist, fps, id_team=id_teams or None, keep_ids=None)
+    pos_rows = []
+    for frame_idx, recs in sorted(timeline.items()):
+        second = _sec(frame_idx)
+        for r in recs:
+            pid = int(r['id'])
+            ghost = bool(r.get('ghost'))
+            h_val = '' if ghost else height_at.get((pid, int(frame_idx)), '')
+            pos_rows.append({
+                'identity_id': pid,
+                'second': second,
+                'x_px': round(float(r['xy'][0]), 1),
+                'y_px': round(float(r['xy'][1]), 1),
+                'box_height_px': h_val,
+                'inferred': ghost,
+            })
+
+    pospath = output_csv_path_for(source_video_path, 'positions')
+    with open(pospath, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=[
+            'identity_id', 'second', 'x_px', 'y_px', 'box_height_px',
+            'inferred'])
+        w.writeheader()
+        w.writerows(pos_rows)
+    paths['positions'] = pospath
+
+    # ---- ball.csv ----
+    ball_rows = []
+    for rec in ball_history:
+        frame_idx, t_sec, x_px, y_px, conf = rec
+        ball_rows.append({
+            'second': round(float(t_sec), 3),
+            'x_px': round(float(x_px), 1),
+            'y_px': round(float(y_px), 1),
+            'confidence': round(float(conf), 4),
+        })
+
+    bpath = output_csv_path_for(source_video_path, 'ball')
+    with open(bpath, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['second', 'x_px', 'y_px',
+                                          'confidence'])
+        w.writeheader()
+        w.writerows(ball_rows)
+    paths['ball'] = bpath
+    paths['_counts'] = {
+        'players': len(player_rows),
+        'positions': len(pos_rows),
+        'ball': len(ball_rows),
+    }
+
+    return paths
 
 
 def in_pitch_boundary(cx_pct: float, cy_pct: float) -> bool:
@@ -1941,9 +2126,8 @@ class PlayerReIDTracker:
         # Team colour, if the kits allow it. Assigned per canonical id by
         # majority vote over that id's crops, then attached to every tracklet
         # cut from it — a tracklet is a segment of one id, so it inherits the
-        # id's team. link_cost() turns a disagreement into a penalty, never a
-        # veto, because the labelling is ~93% and a wrong veto silently leaves
-        # a player fragmented.
+        # id's team. link_cost() adds a soft penalty on disagreement — hard
+        # vetoes were measured worse on this footage (279 -> 328 ids).
         self.id_team = {}
         self.team_vote_frac = {}
         self.team_sep = 0.0
@@ -1960,10 +2144,9 @@ class PlayerReIDTracker:
                             self.id_team[cid] = t
                             self.team_vote_frac[cid] = frac
                     counts = Counter(self.id_team.values())
-                    hard = (clf.separation >= TEAM_HARD_SEP_MIN)
                     print(f"Team colour: separation {clf.separation:.2f}, "
-                          f"{dict(counts)} across {len(self.id_team)} ids"
-                          f"{' [HARD veto armed]' if hard else ' [soft penalty]'}")
+                          f"{dict(counts)} across {len(self.id_team)} ids "
+                          f"[soft penalty only]")
                 else:
                     sep = clf.separation if clf.centres is not None else 0.0
                     print(f"Team colour: separation {sep:.2f} — kits too "
@@ -2418,6 +2601,7 @@ def run_player_tracking(
         return b[[int(np.argmax(b.confidence))]]
 
     ball_history = []
+    frame_seconds: dict = {}
 
     # ---- PASS 1: build lifetime stats (no frames stored in memory) ----
     print("Pass 1: building tracker lifetime stats...")
@@ -2436,12 +2620,13 @@ def run_player_tracking(
     # faithful: pass 2 skipped appearance ReID and ByteTrack re-seeded, so its
     # ids diverged from pass 1's stable set and most players rendered grey.
     frame_boxes: dict = {}
-    for frame in tqdm(
-        video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME),
+    for idx, t_sec, frame in tqdm(
+        iter_tracking_frames(source_video_path, max_frames=max_frames,
+                             start_frame=START_FRAME, fallback_fps=fps),
         desc='Pass 1'
     ):
+        frame_seconds[idx] = t_sec
         raw = detect_raw(frame)
-        idx = tracker1.frame_n
         det = tracker1.update(get_player_detections(frame, raw), frame)
         if not no_render and det.tracker_id is not None and len(det):
             frame_boxes[idx] = (
@@ -2453,9 +2638,12 @@ def run_player_tracking(
         if SHOW_BALL:
             b = get_ball(frame, raw)
             if b is not None and len(b):
-                ball_history.append((tracker1.frame_n,
-                                     float((b.xyxy[0][0] + b.xyxy[0][2]) / 2),
-                                     float(b.xyxy[0][3])))
+                box = b.xyxy[0]
+                ball_history.append((
+                    idx, t_sec,
+                    float((box[0] + box[2]) / 2),
+                    float((box[1] + box[3]) / 2),
+                    float(b.confidence[0])))
 
     raw_id_count = len(tracker1.id_frame_count)
     n_bridged = tracker1.interpolate_short_gaps()
@@ -2701,6 +2889,20 @@ def run_player_tracking(
     print(f"\nID list saved to: {id_path}")
     print("Open it, fill in player_name and team for each ID.\n")
 
+    if SHOW_BALL:
+        ball_frames = len({r[0] for r in ball_history})
+        print(f"Ball tracking: {len(ball_history)} detection(s) in "
+              f"{ball_frames} frame(s)"
+              f"{'' if ball_history else ' — none passed filters; see ball.csv'}")
+
+    csv_paths = write_warehouse_csvs(
+        source_video_path, fps, frame_seconds, identity_map,
+        frag2pid, tracker1, ball_history)
+    cn = csv_paths['_counts']
+    print(f"CSV exports: {csv_paths['players']} ({cn['players']} identities)")
+    print(f"             {csv_paths['positions']} ({cn['positions']} rows)")
+    print(f"             {csv_paths['ball']} ({cn['ball']} rows)")
+
     if no_render:
         # Every number above comes from pass 1; pass 2 exists only to produce
         # the video. Skipping it roughly halves a calibration run.
@@ -2726,22 +2928,21 @@ def run_player_tracking(
     timeline = ball_timeline = {}
     if SHOW_MINIMAP:
         import minimap as mm
+        id_teams = identity_teams_from_map(identity_map)
         if frag2pid:
             # Identity-level history: a player's fragments become one dot,
             # and the gap filler bridges the joins between fragments.
             pid_hist = defaultdict(list)
-            pid_team, pid_class = {}, {}
+            pid_class = {}
             for cid, hist in tracker1.id_history.items():
                 pid = frag2pid.get(int(cid))
                 if pid is None:
                     continue
                 pid_hist[pid].extend(hist)
-                if cid in tracker1.id_team and pid not in pid_team:
-                    pid_team[pid] = tracker1.id_team[cid]
                 pid_class.setdefault(pid, tracker1.dominant_class(cid))
             for pid in pid_hist:
                 pid_hist[pid].sort()
-            timeline = mm.build_timeline(pid_hist, fps, id_team=pid_team,
+            timeline = mm.build_timeline(pid_hist, fps, id_team=id_teams,
                                          id_class=pid_class, keep_ids=None)
         else:
             timeline = mm.build_timeline(
@@ -2750,7 +2951,8 @@ def run_player_tracking(
                 id_class={c: tracker1.dominant_class(c)
                           for c in tracker1.id_frame_count},
                 keep_ids=good_ids)
-        ball_timeline = mm.build_ball_timeline(ball_history, fps)
+        ball_timeline = mm.build_ball_timeline(
+            [(f, x, y) for f, _, x, y, _ in ball_history], fps)
         # Bounds from where players ACTUALLY went, not from the pitch polygon.
         # The polygon runs to the frame bottom because the near touchline is off
         # frame, but players never reach there, so polygon bounds left the lower
@@ -2814,12 +3016,44 @@ def run_player_tracking(
         return cid
 
     if frag2pid:
-        # In identity mode "stable" means assigned to a roster identity; the
-        # HUD's id count is the number of identities, not passed fragments.
+        # Identity mode: good_ids is the merged roster count, not fragment count.
         good_ids = set(frag2pid.values())
 
-    # ball_history frames were taken AFTER tracker1.update bumped frame_n.
-    ball_by_frame = {int(f) - 1: (x, y) for f, x, y in ball_history}
+    # Team lookup for pass-2 ellipses — identity majority vote from identity_map.
+    render_team = identity_teams_from_map(identity_map)
+    if not render_team:
+        for cid, team in tracker1.id_team.items():
+            if team not in (0, 1):
+                continue
+            rid = apply_remap(int(cid))
+            if frag2pid:
+                rid = frag2pid.get(int(rid), int(rid))
+            if rid not in render_team:
+                render_team[int(rid)] = int(team)
+
+    # Palette indices into COLORS (team 0/1 align with minimap light-blue / red).
+    _TEAM0_IDX, _TEAM1_IDX = 1, 2
+    _REF_IDX, _GK_IDX, _UNK_IDX = 0, 3, 3
+
+    def _ellipse_color_lookup(dets):
+        out = []
+        for i in range(len(dets)):
+            cls = int(dets.class_id[i])
+            if cls == REFEREE_CLASS_ID:
+                out.append(_REF_IDX)
+            elif cls == GOALKEEPER_CLASS_ID:
+                out.append(_GK_IDX)
+            else:
+                team = render_team.get(int(dets.tracker_id[i]))
+                if team == 0:
+                    out.append(_TEAM0_IDX)
+                elif team == 1:
+                    out.append(_TEAM1_IDX)
+                else:
+                    out.append(_UNK_IDX)
+        return np.asarray(out, dtype=int)
+
+    ball_by_frame = {int(f): (x, y) for f, _, x, y, _ in ball_history}
 
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
         rec = frame_boxes.get(frame_n)
@@ -2905,16 +3139,24 @@ def run_player_tracking(
                         col   = tuple(int(c * alpha) for c in FOCUS_COLOUR)
                         cv2.line(annotated, trail[j-1], trail[j], col, 2)
             else:
-                labels    = [f"#{int(tid)}" for tid in detections.tracker_id]
-                annotated = ELLIPSE_ANNOTATOR.annotate(annotated, detections)
+                labels       = [f"#{int(tid)}" for tid in detections.tracker_id]
+                color_lookup = _ellipse_color_lookup(detections)
+                annotated = ELLIPSE_ANNOTATOR.annotate(
+                    annotated, detections, custom_color_lookup=color_lookup)
                 annotated = ELLIPSE_LABEL_ANNOTATOR.annotate(
-                    annotated, detections, labels=labels)
+                    annotated, detections, labels=labels,
+                    custom_color_lookup=color_lookup)
 
-        # HUD counter
-        cv2.rectangle(annotated, (0, 0), (520, 36), (0, 0, 0), -1)
-        cv2.putText(annotated,
-                    f"Players: {n_detected}  |  Stable ID: {n_stable}  |  "
-                    f"IDs: {len(good_ids)}",
+        # HUD: only numbers computed this run — no temporal-stability claim.
+        id_count_label = "Identities" if frag2pid else "Track IDs"
+        hud_text = (
+            f"Players: {n_detected}  |  Mapped: {n_stable}  |  "
+            f"{id_count_label}: {len(good_ids)}  |  "
+            f"Fragments: {pass1_metrics['fragments']}  "
+            f"(med {pass1_metrics['median_span_s']}s)"
+        )
+        cv2.rectangle(annotated, (0, 0), (780, 36), (0, 0, 0), -1)
+        cv2.putText(annotated, hud_text,
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.65, (255, 255, 255), 1)
 
@@ -3371,8 +3613,9 @@ if __name__ == '__main__':
              'none at all on dry, worn pitches).')
     parser.add_argument('--include_referees', action='store_true',
         help='Track referees as well as players.')
-    parser.add_argument('--show_ball', action='store_true',
-        help='Draw ball detections on the rendered video.')
+    parser.add_argument('--no_ball', action='store_true',
+        help='Disable ball detection, ball.csv export, and ball overlay '
+             '(ball tracking is on by default for PLAYER_TRACKING).')
     parser.add_argument('--detector', type=str, default=None, choices=['yolo','rfdetr'],
         help="Detector backend. 'rfdetr' uses the local Roboflow v20 transformer "
              "(see rfdetr_onnx.py) which generalises far better across grounds; "
@@ -3454,8 +3697,8 @@ if __name__ == '__main__':
         ASSIGN_ROSTER_MAX = args.roster_max
     if args.include_referees:
         INCLUDE_REFEREES = True
-    if args.show_ball:
-        SHOW_BALL = True
+    if args.no_ball:
+        SHOW_BALL = False
     if args.detector:
         DETECTOR = args.detector
         if args.conf is None and args.detector == 'rfdetr':

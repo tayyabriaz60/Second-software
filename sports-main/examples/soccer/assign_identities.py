@@ -16,8 +16,8 @@ What makes this tractable on a stationary camera with a closed roster:
   * scale-free motion — pixel distance means nothing across the pitch depth,
     so gaps are judged in BODY HEIGHTS per second (box height as the ruler).
     A sprint is ~5.7 bh/s; the reach budget is that plus jitter slack.
-  * team colour — hard veto when both fragments are confidently different
-    kits under strong separation, soft penalty otherwise.
+  * team colour — soft penalty on kit disagreement (hard veto disabled;
+    measured worse on this footage).
   * appearance — SigLIP cosine, used as a soft term only (it does not
     separate same-kit players reliably).
   * cardinality — the number of identities should approach the roster. The
@@ -60,6 +60,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from team_colour import TEAM_MISMATCH_PENALTY as TEAM_SOFT_PENALTY
+
 try:
     from scipy.optimize import linear_sum_assignment
 except ImportError:                                   # pragma: no cover
@@ -77,9 +79,6 @@ PREDICT_MAX_SECONDS = 0.8      # extrapolate exit velocity at most this far
 MAX_GAP_SECONDS = 12.0
 GAP_WEIGHT = 0.30              # cost for using the gap budget
 APPEARANCE_WEIGHT = 0.40       # cost per unit of (1 - cosine)
-TEAM_SOFT_PENALTY = 0.50
-TEAM_CONF_MIN = 0.70           # vote fraction to treat a team label as firm
-TEAM_HARD_SEP_MIN = 2.0        # kit separation for the hard veto
 SCALE_JUMP_PENALTY = 0.40      # box height ratio far from 1 across the gap
 LONG_GAP_FLOOR_S = 8.0         # gaps above this ignore exit velocity entirely
 CONFIDENT_MARGIN = 0.35        # abs margin over runner-up for "confident"
@@ -363,12 +362,8 @@ def link_cost(a: Fragment, b: Fragment, fps: float, hmodel, team_sep: float,
     if ratio < 1 / 1.6 or ratio > 1.6:
         cost += SCALE_JUMP_PENALTY * (1.0 if gap_s < 5 else 0.5)
 
-    # Team: hard veto only when both are firm under strong kit separation.
+    # Team: soft penalty only — same constant as stitch_tracks / team_colour.
     if a.team is not None and b.team is not None and a.team != b.team:
-        firm = ((a.team_conf or 0) >= TEAM_CONF_MIN and
-                (b.team_conf or 0) >= TEAM_CONF_MIN)
-        if firm and team_sep >= TEAM_HARD_SEP_MIN:
-            return None
         cost += TEAM_SOFT_PENALTY
 
     sim = _cos(a.appearance, b.appearance)

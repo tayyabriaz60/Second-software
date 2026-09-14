@@ -124,10 +124,8 @@ class Tracklet:
         self.frames = frames
         self.xy = xy
         self.cls = cls
-        # Optional team label. When both ends of a candidate link know their
-        # team with high confidence and disagree under a strong kit separation,
-        # the link is HARD-VETOED. Weaker evidence only adds a soft penalty —
-        # see team_colour module docstring / TEAM_HARD_SEP_MIN.
+        # Optional team label. Disagreement adds a soft penalty via
+        # team_penalty() — hard vetoes were measured worse on this footage.
         self.team = team
         self.team_conf = team_conf
         self.team_sep = team_sep
@@ -218,13 +216,9 @@ def link_cost(a: Tracklet, b: Tracklet, fps: float,
             return None
         # Reward high cosine (lower cost).
         cost *= (1.0 - 0.35 * sim)
-    # Team disagreement: HARD veto when both ends are confident and kit
-    # separation is strong; otherwise a soft penalty (see team_colour).
+    # Team disagreement: soft penalty only (hard veto measured 279 -> 328 ids).
     try:
-        from team_colour import team_penalty, team_hard_conflict
-        if team_hard_conflict(a.team, b.team, a.team_conf, b.team_conf,
-                              max(a.team_sep, b.team_sep)):
-            return None
+        from team_colour import team_penalty
         cost += team_penalty(a.team, b.team)
     except ImportError:
         pass
