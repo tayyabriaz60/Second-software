@@ -307,17 +307,15 @@ TRACK_DETECT_FLOOR = 0.15
 # only 21% of hits inside the pitch with one static x band supplying 58% of them.
 BALL_MIN_CONF = 0.30
 BALL_CELL_PX = 64
-BALL_HISTORY_FRAMES = 90
-# A cell producing a ball in more than this fraction of recent ball-detection
-# frames is furniture. Window counts only frames where a ball was detected.
-BALL_STATIC_FRACTION = 0.20
-# Absolute floor: a fixed post can fall below the fraction on sparse clips but
-# still repeat at the same pixel (measured: 907,166 hit 159x on 14_08).
-BALL_STATIC_WINDOW_ABS = 10
-# Lifetime ban when a fine cell's detections barely move (goalpost / flag).
-BALL_STATIC_MIN_HITS = 10
-BALL_STATIC_MAX_SPREAD_PX = 15.0
-BALL_STATIC_COARSE_CELL_PX = 128
+# Static furniture suppression is opt-in (--ball_static_suppress). Default off:
+# a real ball is often motionless before set pieces, and over an 18-min clip it
+# revisits every cell many times. The measured false positive was one spot
+# (907,166) at 1.4% of detections on the pitch edge — the opt-in filter targets
+# that pattern only, after the full pass, not online.
+BALL_STATIC_SUPPRESS = False
+BALL_FURNITURE_MIN_FRAC = 0.01       # >1% of all ball rows in the run
+BALL_FURNITURE_MAX_SPREAD_PX = 5.0   # immobile across the whole clip
+BALL_FURNITURE_EDGE_MARGIN_PX = 80.0 # outside polygon or within this of edge
 
 # 2D player/ball map in the corner of the render. On by default: reading team
 # shape off a 4096px frame is hard, and a dropped ring is invisible among 22
@@ -889,6 +887,59 @@ def write_warehouse_csvs(source_video_path: str, fps: float,
 def in_pitch_boundary(cx_pct: float, cy_pct: float) -> bool:
     return (PITCH_LEFT_PCT <= cx_pct <= PITCH_RIGHT_PCT and
             PITCH_TOP_PCT  <= cy_pct <= PITCH_BOTTOM_PCT)
+
+
+def _ball_furniture_at_edge(x_px: float, y_px: float,
+                            edge_margin: float = BALL_FURNITURE_EDGE_MARGIN_PX
+                            ) -> bool:
+    """True when a fixed object is safer to drop: outside pitch or on its edge."""
+    if PITCH_POLYGON is None:
+        return False
+    dist = cv2.pointPolygonTest(
+        PITCH_POLYGON, (float(x_px), float(y_px)), True)
+    return dist < 0 or dist < edge_margin
+
+
+def suppress_static_ball_furniture(ball_history: list) -> tuple:
+    """Opt-in post-pass: drop pitch-edge furniture, not set-piece stillness.
+
+    Measured false positive: (907,166) hit 159/11204 times (1.4%) with
+    neighbours clustered — a goalpost, not the ball at rest mid-pitch.
+    """
+    if not ball_history:
+        return ball_history, 0, []
+
+    cell_pts: dict = defaultdict(list)
+    for rec in ball_history:
+        x_px, y_px = float(rec[2]), float(rec[3])
+        cell = (int(x_px) // BALL_CELL_PX, int(y_px) // BALL_CELL_PX)
+        cell_pts[cell].append((x_px, y_px))
+
+    n_total = len(ball_history)
+    min_hits = max(15, int(BALL_FURNITURE_MIN_FRAC * n_total))
+    banned: set = set()
+
+    for cell, pts in cell_pts.items():
+        if len(pts) < min_hits:
+            continue
+        xs, ys = zip(*pts)
+        if (float(np.std(xs)) > BALL_FURNITURE_MAX_SPREAD_PX
+                or float(np.std(ys)) > BALL_FURNITURE_MAX_SPREAD_PX):
+            continue
+        cx, cy = float(np.mean(xs)), float(np.mean(ys))
+        if not _ball_furniture_at_edge(cx, cy):
+            continue
+        banned.add(cell)
+
+    if not banned:
+        return ball_history, 0, []
+
+    def _cell_of(rec):
+        return (int(float(rec[2])) // BALL_CELL_PX,
+                int(float(rec[3])) // BALL_CELL_PX)
+
+    kept = [rec for rec in ball_history if _cell_of(rec) not in banned]
+    return kept, len(ball_history) - len(kept), sorted(banned)
 
 
 # Fitted by fit_far_touchline() at startup; None means fall back to the % box.
@@ -2559,28 +2610,18 @@ def run_player_tracking(
             detections = detections[np.isin(detections.class_id, wanted)]
         return detections
 
-    _ball_recent = deque(maxlen=BALL_HISTORY_FRAMES)
-    _ball_cell_xy: dict = defaultdict(list)
-    _ball_hotspots: set = set()
-
     def get_ball(frame, raw=None):
-        """The ball, with the three checks the raw detections lack.
+        """The ball, with sanity checks the raw detections lack.
 
         Measured over 33s of 14_09: 1473 ball detections above 0.30, in 1107 of
         1800 frames, with 303 frames offering more than one. Only 309 of the
         1473 were inside the pitch polygon, and a single 256px-wide x band held
         853 of them — a goalpost, detected as a ball over and over.
 
-        Size cannot separate them: false balls measured 19px median against the
-        real ball's 19px. Position and persistence can.
-
           1. inside the pitch polygon — removed ~79% on this footage
-          2. not in a STATIC hotspot — the same trick that fixed the pitch
-             polygon. A real ball moves; a cell that keeps producing a ball
-             across many recent frames is furniture. Rolling, so it needs no
-             extra pass over the video.
-          3. one ball per frame — there is only one, so keep the most
-             confident survivor rather than drawing every candidate.
+          2. one ball per frame — keep the most confident survivor
+          3. static furniture — opt-in post-pass only (--ball_static_suppress);
+             online suppression banned real balls at rest during set pieces.
         """
         if not SHOW_BALL:
             return None
@@ -2595,11 +2636,6 @@ def run_player_tracking(
 
         cx = (b.xyxy[:, 0] + b.xyxy[:, 2]) / 2
         cy = (b.xyxy[:, 1] + b.xyxy[:, 3]) / 2
-        cells = [(int(x) // BALL_CELL_PX, int(y) // BALL_CELL_PX)
-                 for x, y in zip(cx, cy)]
-        coarse = [(int(x) // BALL_STATIC_COARSE_CELL_PX,
-                   int(y) // BALL_STATIC_COARSE_CELL_PX)
-                  for x, y in zip(cx, cy)]
 
         keep = np.ones(len(b), dtype=bool)
         if PITCH_POLYGON is not None:
@@ -2607,35 +2643,6 @@ def run_player_tracking(
                 cv2.pointPolygonTest(PITCH_POLYGON, (float(x), float(y)),
                                      False) >= 0
                 for x, y in zip(cx, b.xyxy[:, 3])])
-
-        # Rolling window over ball-detection frames only (not every video frame).
-        if len(_ball_recent) >= max(20, BALL_HISTORY_FRAMES // 3):
-            seen = Counter(c for frame_cells in _ball_recent
-                           for c in set(frame_cells))
-            limit = max(BALL_STATIC_WINDOW_ABS,
-                        BALL_STATIC_FRACTION * len(_ball_recent))
-            keep &= np.array([seen[c] < limit for c in cells])
-
-        # Lifetime hotspot: same fine cell, many hits, almost no motion.
-        for i, c in enumerate(cells):
-            _ball_cell_xy[c].append((float(cx[i]), float(cy[i])))
-            if len(_ball_cell_xy[c]) > 120:
-                _ball_cell_xy[c] = _ball_cell_xy[c][-120:]
-            pts = _ball_cell_xy[c]
-            if len(pts) >= BALL_STATIC_MIN_HITS:
-                xs, ys = zip(*pts)
-                if (float(np.std(xs)) <= BALL_STATIC_MAX_SPREAD_PX
-                        and float(np.std(ys)) <= BALL_STATIC_MAX_SPREAD_PX):
-                    cc = coarse[i]
-                    for dx in (-1, 0, 1):
-                        for dy in (-1, 0, 1):
-                            _ball_hotspots.add((cc[0] + dx, cc[1] + dy))
-        if _ball_hotspots:
-            keep &= np.array([cc not in _ball_hotspots for cc in coarse])
-
-        # History records every candidate, filtered or not — a hotspot has to
-        # stay visible for the suppressor to keep suppressing it.
-        _ball_recent.append(cells)
 
         b = b[keep]
         if len(b) == 0:
@@ -2932,13 +2939,19 @@ def run_player_tracking(
     print("Open it, fill in player_name and team for each ID.\n")
 
     if SHOW_BALL:
+        if BALL_STATIC_SUPPRESS and ball_history:
+            ball_history, n_furn, furn_cells = suppress_static_ball_furniture(
+                ball_history)
+            if n_furn:
+                print(f"  Static furniture filter (opt-in): removed {n_furn} "
+                      f"detection(s) from {len(furn_cells)} pitch-edge cell(s)")
+            elif PITCH_POLYGON is None:
+                print("  Static furniture filter (opt-in): skipped — no pitch "
+                      "polygon (need edge test to avoid dropping set pieces)")
         ball_frames = len({r[0] for r in ball_history})
         print(f"Ball tracking: {len(ball_history)} detection(s) in "
               f"{ball_frames} frame(s)"
               f"{'' if ball_history else ' — none passed filters; see ball.csv'}")
-        if _ball_hotspots:
-            print(f"  Static ball hotspots: {len(_ball_hotspots)} coarse "
-                  f"cell(s) banned (goalpost / fixed-object suppressor)")
 
     csv_paths = write_warehouse_csvs(
         source_video_path, fps, frame_seconds, identity_map,
@@ -3668,6 +3681,10 @@ if __name__ == '__main__':
     parser.add_argument('--no_ball', action='store_true',
         help='Disable ball detection, ball.csv export, and ball overlay '
              '(ball tracking is on by default for PLAYER_TRACKING).')
+    parser.add_argument('--ball_static_suppress', action='store_true',
+        help='Opt-in post-pass: drop pitch-edge furniture (>1%% of ball rows, '
+             'immobile, outside/near polygon edge). Default off — a motionless '
+             'ball at a set piece looks like furniture to online suppressors.')
     parser.add_argument('--detector', type=str, default=None, choices=['yolo','rfdetr'],
         help="Detector backend. 'rfdetr' uses the local Roboflow v20 transformer "
              "(see rfdetr_onnx.py) which generalises far better across grounds; "
@@ -3751,6 +3768,8 @@ if __name__ == '__main__':
         INCLUDE_REFEREES = True
     if args.no_ball:
         SHOW_BALL = False
+    if args.ball_static_suppress:
+        BALL_STATIC_SUPPRESS = True
     if args.detector:
         DETECTOR = args.detector
         if args.conf is None and args.detector == 'rfdetr':
