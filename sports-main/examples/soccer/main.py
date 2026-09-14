@@ -3018,9 +3018,17 @@ def run_player_tracking(
     print(f"             {csv_paths['events']} ({cn['events']} events)")
     if em.get('counts_by_type'):
         print(f"  Events by type: {em['counts_by_type']}")
-    if em.get('furniture_cells'):
-        print(f"  Events: ignored {em['furniture_cells']} furniture cell(s), "
-              f"{em.get('skipped_touchline_or_side', 0)} touchline still-run(s)")
+    fn = em.get('funnel')
+    if fn:
+        print(f"  Events funnel: still_runs={fn.get('still_runs', 0)}  "
+              f"zone_raw={fn.get('zone_raw', {})}")
+        print(f"               candidates={fn.get('zone_candidates', {})}  "
+              f"rejected_zone_none={fn.get('rejected_zone_none', 0)}  "
+              f"rejected_furniture_free_kick="
+              f"{fn.get('rejected_furniture_free_kick', 0)}  "
+              f"rejected_dedupe={fn.get('rejected_dedupe', 0)}  "
+              f"furniture_cells={fn.get('furniture_cells', 0)}  "
+              f"emitted={fn.get('emitted', {})}")
     if em.get('goals_note'):
         print(f"  Note: {em['goals_note']}")
 

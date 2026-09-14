@@ -13,14 +13,15 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 import cv2
 import numpy as np
 
-# Pitch zones as % of frame (stationary wide angle), from analyse.py
-CORNER_X_PCT = 8.0
-CORNER_Y_PCT = 10.0
-GOAL_AREA_X_PCT = 8.0
-GOAL_AREA_Y_PCT = (35.0, 65.0)
+# Pitch zones as % of frame (stationary wide angle). Slightly wider than analyse.py
+# on this panoramic — corners at y≈12% were missing the old 10% cut.
+CORNER_X_PCT = 10.0
+CORNER_Y_PCT = 15.0
+GOAL_AREA_X_PCT = 12.0
+GOAL_AREA_Y_PCT = (30.0, 70.0)
 PENALTY_X_PCT = 18.0
 PENALTY_Y_PCT = (20.0, 80.0)
-# Top/bottom touchline band — static posts/flags read as ball here (v14: 1026,150)
+# Touchline band for generic free_kick only — corners/goal_kicks checked first.
 TOUCHLINE_Y_PCT = 15.0
 
 # Ball stillness — proxy for a dead ball at a set piece
@@ -31,7 +32,7 @@ DEDUP_WINDOW_S = 12.0
 DEDUP_SPATIAL_PX = 120.0
 MIN_BALL_CONF = 0.30
 
-# Furniture signature (measured: goalpost 159/11204 at one pixel; v14 ghost ~1026,150)
+# Furniture signature — applied to free_kick only (corners/goal_kicks ARE at edge)
 BALL_CELL_PX = 64
 FURNITURE_MIN_FRAC = 0.01
 FURNITURE_MAX_SPREAD_PX = 5.0
@@ -131,8 +132,6 @@ def _zone_confidence_scale(event_type: str) -> float:
 
 def _still_runs(
     ball_history: Sequence[Tuple],
-    furniture: Set[Tuple[int, int]],
-    cell_px: int = BALL_CELL_PX,
     still_dist_px: float = STILL_DIST_PX,
     max_gap_s: float = STILL_MAX_GAP_S,
     min_duration_s: float = STILL_MIN_DURATION_S,
@@ -155,6 +154,25 @@ def _still_runs(
     if not pts:
         return []
 
+    def _append_run(chunk: list) -> Optional[dict]:
+        if not chunk:
+            return None
+        ts, te = chunk[0][0], chunk[-1][0]
+        if te - ts < min_duration_s:
+            return None
+        mx = sum(p[1] for p in chunk) / len(chunk)
+        my = sum(p[2] for p in chunk) / len(chunk)
+        return {
+            "start_s": ts,
+            "end_s": te,
+            "second": (ts + te) / 2.0,
+            "x_px": mx,
+            "y_px": my,
+            "mean_conf": sum(p[3] for p in chunk) / len(chunk),
+            "duration_s": te - ts,
+            "samples": len(chunk),
+        }
+
     runs: List[dict] = []
     run_start = 0
     for i in range(1, len(pts)):
@@ -164,44 +182,14 @@ def _still_runs(
         gap = t1 - t0
         if dist <= still_dist_px and gap <= max_gap_s:
             continue
-        ts, _, _, _ = pts[run_start]
-        te, _, _, _ = pts[i - 1]
-        if te - ts >= min_duration_s:
-            chunk = pts[run_start:i]
-            mx = sum(p[1] for p in chunk) / len(chunk)
-            my = sum(p[2] for p in chunk) / len(chunk)
-            cell = (int(mx) // cell_px, int(my) // cell_px)
-            if cell not in furniture:
-                runs.append({
-                    "start_s": ts,
-                    "end_s": te,
-                    "second": (ts + te) / 2.0,
-                    "x_px": mx,
-                    "y_px": my,
-                    "mean_conf": sum(p[3] for p in chunk) / len(chunk),
-                    "duration_s": te - ts,
-                    "samples": len(chunk),
-                })
+        rec = _append_run(pts[run_start:i])
+        if rec is not None:
+            runs.append(rec)
         run_start = i
 
-    ts, _, _, _ = pts[run_start]
-    te, _, _, _ = pts[-1]
-    if te - ts >= min_duration_s:
-        chunk = pts[run_start:]
-        mx = sum(p[1] for p in chunk) / len(chunk)
-        my = sum(p[2] for p in chunk) / len(chunk)
-        cell = (int(mx) // cell_px, int(my) // cell_px)
-        if cell not in furniture:
-            runs.append({
-                "start_s": ts,
-                "end_s": te,
-                "second": (ts + te) / 2.0,
-                "x_px": mx,
-                "y_px": my,
-                "mean_conf": sum(p[3] for p in chunk) / len(chunk),
-                "duration_s": te - ts,
-                "samples": len(chunk),
-            })
+    rec = _append_run(pts[run_start:])
+    if rec is not None:
+        runs.append(rec)
     return runs
 
 
@@ -227,21 +215,40 @@ def detect_ball_events(
 ) -> Tuple[List[dict], Dict]:
     """Return (events, meta). Goals are never emitted — see meta['goals_note']."""
     furniture = furniture_cells(ball_history, pitch_polygon)
-    runs = _still_runs(ball_history, furniture)
+    runs = _still_runs(ball_history)
 
     events: List[dict] = []
-    skipped_furniture = 0
-    skipped_zone = 0
+    zone_raw: Dict[str, int] = defaultdict(int)
+    zone_candidates: Dict[str, int] = defaultdict(int)
+    rejected_zone_none = 0
+    rejected_furniture_free_kick = 0
+    rejected_dedupe = 0
+    emitted: Dict[str, int] = defaultdict(int)
 
     for run in runs:
         x_pct, y_pct = px_to_pct(run["x_px"], run["y_px"], width, height)
         etype = classify_zone(x_pct, y_pct)
+        zone_raw[etype or "zone_none"] += 1
+
         if etype is None:
-            skipped_zone += 1
+            rejected_zone_none += 1
             continue
+
+        zone_candidates[etype] += 1
+
+        # Furniture filter: free_kick only — corners/goal_kicks live at the edge.
+        if etype == "free_kick":
+            cell = (int(run["x_px"]) // BALL_CELL_PX,
+                    int(run["y_px"]) // BALL_CELL_PX)
+            if cell in furniture:
+                rejected_furniture_free_kick += 1
+                continue
+
         second = round(run["second"], 3)
         if _event_exists(events, etype, second, run["x_px"], run["y_px"]):
+            rejected_dedupe += 1
             continue
+
         dur_boost = min(0.12, max(0.0, run["duration_s"] - STILL_MIN_DURATION_S) * 0.04)
         conf = min(
             0.95,
@@ -254,11 +261,10 @@ def detect_ball_events(
             "y_px": round(run["y_px"], 1),
             "confidence": round(conf, 4),
         })
+        emitted[etype] += 1
 
     events.sort(key=lambda e: e["second"])
-    by_type: Dict[str, int] = {}
-    for e in events:
-        by_type[e["event_type"]] = by_type.get(e["event_type"], 0) + 1
+    by_type: Dict[str, int] = dict(emitted)
 
     meta = {
         "goals_note": GOALS_NOTE,
@@ -266,8 +272,16 @@ def detect_ball_events(
         "method": "ball_stillness_zone_heuristic",
         "counts_by_type": by_type,
         "total": len(events),
-        "furniture_cells": len(furniture),
-        "skipped_touchline_or_side": skipped_zone,
+        "funnel": {
+            "still_runs": len(runs),
+            "zone_raw": dict(zone_raw),
+            "zone_candidates": dict(zone_candidates),
+            "rejected_zone_none": rejected_zone_none,
+            "rejected_furniture_free_kick": rejected_furniture_free_kick,
+            "rejected_dedupe": rejected_dedupe,
+            "furniture_cells": len(furniture),
+            "emitted": dict(emitted),
+        },
     }
     return events, meta
 
