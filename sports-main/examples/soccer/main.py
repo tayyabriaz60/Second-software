@@ -308,10 +308,16 @@ TRACK_DETECT_FLOOR = 0.15
 BALL_MIN_CONF = 0.30
 BALL_CELL_PX = 64
 BALL_HISTORY_FRAMES = 90
-# A cell producing a ball in more than this fraction of recent frames is
-# furniture. A real ball crosses a 64px cell in a fraction of a second, so it
-# cannot occupy one for 25% of a 90-frame window; a goalpost does exactly that.
-BALL_STATIC_FRACTION = 0.25
+# A cell producing a ball in more than this fraction of recent ball-detection
+# frames is furniture. Window counts only frames where a ball was detected.
+BALL_STATIC_FRACTION = 0.20
+# Absolute floor: a fixed post can fall below the fraction on sparse clips but
+# still repeat at the same pixel (measured: 907,166 hit 159x on 14_08).
+BALL_STATIC_WINDOW_ABS = 10
+# Lifetime ban when a fine cell's detections barely move (goalpost / flag).
+BALL_STATIC_MIN_HITS = 10
+BALL_STATIC_MAX_SPREAD_PX = 15.0
+BALL_STATIC_COARSE_CELL_PX = 128
 
 # 2D player/ball map in the corner of the render. On by default: reading team
 # shape off a 4096px frame is hard, and a dropped ring is invisible among 22
@@ -725,8 +731,10 @@ def identity_teams_from_map(identity_map: Optional[dict]) -> dict:
 
 def write_warehouse_csvs(source_video_path: str, fps: float,
                          frame_seconds: dict, identity_map: Optional[dict],
-                         frag2pid: dict, tracker1, ball_history: list) -> dict:
+                         frag2pid: dict, tracker1, ball_history: list,
+                         video_width: int, video_height: int) -> dict:
     """Flat CSV exports for warehouse ingest — seconds, pixels, honest units."""
+    import events as ev
     import minimap as mm
 
     def _sec(frame_idx: int) -> float:
@@ -860,10 +868,19 @@ def write_warehouse_csvs(source_video_path: str, fps: float,
         w.writeheader()
         w.writerows(ball_rows)
     paths['ball'] = bpath
+
+    event_rows, event_meta = ev.detect_ball_events(
+        ball_history, video_width, video_height)
+    epath = output_csv_path_for(source_video_path, 'events')
+    ev.write_events_csv(epath, event_rows)
+    paths['events'] = epath
+    paths['_event_meta'] = event_meta
+
     paths['_counts'] = {
         'players': len(player_rows),
         'positions': len(pos_rows),
         'ball': len(ball_rows),
+        'events': len(event_rows),
     }
 
     return paths
@@ -2543,6 +2560,8 @@ def run_player_tracking(
         return detections
 
     _ball_recent = deque(maxlen=BALL_HISTORY_FRAMES)
+    _ball_cell_xy: dict = defaultdict(list)
+    _ball_hotspots: set = set()
 
     def get_ball(frame, raw=None):
         """The ball, with the three checks the raw detections lack.
@@ -2578,6 +2597,9 @@ def run_player_tracking(
         cy = (b.xyxy[:, 1] + b.xyxy[:, 3]) / 2
         cells = [(int(x) // BALL_CELL_PX, int(y) // BALL_CELL_PX)
                  for x, y in zip(cx, cy)]
+        coarse = [(int(x) // BALL_STATIC_COARSE_CELL_PX,
+                   int(y) // BALL_STATIC_COARSE_CELL_PX)
+                  for x, y in zip(cx, cy)]
 
         keep = np.ones(len(b), dtype=bool)
         if PITCH_POLYGON is not None:
@@ -2585,11 +2607,31 @@ def run_player_tracking(
                 cv2.pointPolygonTest(PITCH_POLYGON, (float(x), float(y)),
                                      False) >= 0
                 for x, y in zip(cx, b.xyxy[:, 3])])
-        if len(_ball_recent) >= BALL_HISTORY_FRAMES // 2:
+
+        # Rolling window over ball-detection frames only (not every video frame).
+        if len(_ball_recent) >= max(20, BALL_HISTORY_FRAMES // 3):
             seen = Counter(c for frame_cells in _ball_recent
                            for c in set(frame_cells))
-            limit = BALL_STATIC_FRACTION * len(_ball_recent)
+            limit = max(BALL_STATIC_WINDOW_ABS,
+                        BALL_STATIC_FRACTION * len(_ball_recent))
             keep &= np.array([seen[c] < limit for c in cells])
+
+        # Lifetime hotspot: same fine cell, many hits, almost no motion.
+        for i, c in enumerate(cells):
+            _ball_cell_xy[c].append((float(cx[i]), float(cy[i])))
+            if len(_ball_cell_xy[c]) > 120:
+                _ball_cell_xy[c] = _ball_cell_xy[c][-120:]
+            pts = _ball_cell_xy[c]
+            if len(pts) >= BALL_STATIC_MIN_HITS:
+                xs, ys = zip(*pts)
+                if (float(np.std(xs)) <= BALL_STATIC_MAX_SPREAD_PX
+                        and float(np.std(ys)) <= BALL_STATIC_MAX_SPREAD_PX):
+                    cc = coarse[i]
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            _ball_hotspots.add((cc[0] + dx, cc[1] + dy))
+        if _ball_hotspots:
+            keep &= np.array([cc not in _ball_hotspots for cc in coarse])
 
         # History records every candidate, filtered or not — a hotspot has to
         # stay visible for the suppressor to keep suppressing it.
@@ -2894,14 +2936,24 @@ def run_player_tracking(
         print(f"Ball tracking: {len(ball_history)} detection(s) in "
               f"{ball_frames} frame(s)"
               f"{'' if ball_history else ' — none passed filters; see ball.csv'}")
+        if _ball_hotspots:
+            print(f"  Static ball hotspots: {len(_ball_hotspots)} coarse "
+                  f"cell(s) banned (goalpost / fixed-object suppressor)")
 
     csv_paths = write_warehouse_csvs(
         source_video_path, fps, frame_seconds, identity_map,
-        frag2pid, tracker1, ball_history)
+        frag2pid, tracker1, ball_history,
+        int(video_info.width), int(video_info.height))
     cn = csv_paths['_counts']
+    em = csv_paths.get('_event_meta', {})
     print(f"CSV exports: {csv_paths['players']} ({cn['players']} identities)")
     print(f"             {csv_paths['positions']} ({cn['positions']} rows)")
     print(f"             {csv_paths['ball']} ({cn['ball']} rows)")
+    print(f"             {csv_paths['events']} ({cn['events']} events)")
+    if em.get('counts_by_type'):
+        print(f"  Events by type: {em['counts_by_type']}")
+    if em.get('goals_note'):
+        print(f"  Note: {em['goals_note']}")
 
     if no_render:
         # Every number above comes from pass 1; pass 2 exists only to produce
