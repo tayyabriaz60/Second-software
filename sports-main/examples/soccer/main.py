@@ -892,6 +892,17 @@ def in_pitch_boundary(cx_pct: float, cy_pct: float) -> bool:
             PITCH_TOP_PCT  <= cy_pct <= PITCH_BOTTOM_PCT)
 
 
+def _ball_conf_distribution_line(confs: np.ndarray) -> str:
+    """Min, max, and deciles for get_ball output confidence."""
+    if confs.size == 0:
+        return "(empty)"
+    deciles = np.percentile(confs, [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+    labels = ['min', 'p10', 'p20', 'p30', 'p40', 'p50',
+              'p60', 'p70', 'p80', 'p90', 'max']
+    parts = [f"{lb}={float(v):.3f}" for lb, v in zip(labels, deciles)]
+    return "  ".join(parts)
+
+
 def suppress_static_ball_furniture(ball_history: list) -> tuple:
     """Opt-in post-pass: drop pitch-edge furniture, not set-piece stillness."""
     import events as ev
@@ -2591,6 +2602,12 @@ def run_player_tracking(
         np.asarray(PITCH_POLYGON, dtype=np.int32).copy()
         if PITCH_POLYGON is not None else None)
     _ball_recent = deque(maxlen=BALL_HISTORY_FRAMES)
+    _ball_diag = {
+        'frames': 0,
+        'raw_ball_any': 0,       # frame has ball class (any conf)
+        'raw_ball_min_conf': 0,  # frame has ball class >= BALL_MIN_CONF
+        'get_ball_out': 0,       # get_ball returned a detection
+    }
 
     def get_ball(frame, raw=None):
         """The ball, with sanity checks the raw detections lack.
@@ -2686,8 +2703,16 @@ def run_player_tracking(
         # Ball in pass 1 costs nothing now that detection is shared, and gives
         # the map a full trajectory to smooth rather than a strobing marker.
         if SHOW_BALL:
+            _ball_diag['frames'] += 1
+            if len(raw) and raw.class_id is not None and raw.confidence is not None:
+                ball_mask = raw.class_id == BALL_CLASS_ID
+                if np.any(ball_mask):
+                    _ball_diag['raw_ball_any'] += 1
+                    if np.any(raw.confidence[ball_mask] >= BALL_MIN_CONF):
+                        _ball_diag['raw_ball_min_conf'] += 1
             b = get_ball(frame, raw)
             if b is not None and len(b):
+                _ball_diag['get_ball_out'] += 1
                 box = b.xyxy[0]
                 ball_history.append((
                     idx, t_sec,
@@ -2957,12 +2982,26 @@ def run_player_tracking(
         print(f"Ball tracking: {len(ball_history)} detection(s) in "
               f"{ball_frames} frame(s) ({pct:.1f}% of {n_proc} processed) "
               f"[{poly_note}, rolling static suppressor on]")
+        print(f"  Ball conf gates: BALL_MIN_CONF={BALL_MIN_CONF}  "
+              f"BALL_ACCEPT_MIN_CONF={BALL_ACCEPT_MIN_CONF}")
+        d = _ball_diag
+        if d['frames']:
+            print(f"  Ball funnel (frames): processed={d['frames']}  "
+                  f"raw_ball_class={d['raw_ball_any']} "
+                  f"({100*d['raw_ball_any']/d['frames']:.1f}%)  "
+                  f"ball>={BALL_MIN_CONF}={d['raw_ball_min_conf']} "
+                  f"({100*d['raw_ball_min_conf']/d['frames']:.1f}%)  "
+                  f"get_ball_out={d['get_ball_out']} "
+                  f"({100*d['get_ball_out']/d['frames']:.1f}%)")
         if ball_history:
             confs = np.asarray([float(r[4]) for r in ball_history])
-            print(f"  Ball confidence: min={confs.min():.3f}  "
-                  f"median={float(np.median(confs)):.3f}  max={confs.max():.3f}")
+            print(f"  get_ball confidence: {_ball_conf_distribution_line(confs)}")
+            at_floor = int((confs <= BALL_ACCEPT_MIN_CONF + 1e-6).sum())
+            if at_floor:
+                print(f"  WARNING: {at_floor}/{len(confs)} get_ball outputs "
+                      f"at BALL_ACCEPT_MIN_CONF floor ({BALL_ACCEPT_MIN_CONF})")
         else:
-            print("  — none passed filters")
+            print("  — none passed get_ball filters")
         if PITCH_POLYGON is None and _ball_pitch_polygon is not None:
             print("  Note: player pitch polygon was disabled mid-run; ball kept "
                   "the startup polygon")
