@@ -868,7 +868,8 @@ def write_warehouse_csvs(source_video_path: str, fps: float,
     paths['ball'] = bpath
 
     event_rows, event_meta = ev.detect_ball_events(
-        ball_history, video_width, video_height)
+        ball_history, video_width, video_height,
+        pitch_polygon=PITCH_POLYGON)
     epath = output_csv_path_for(source_video_path, 'events')
     ev.write_events_csv(epath, event_rows)
     paths['events'] = epath
@@ -889,48 +890,19 @@ def in_pitch_boundary(cx_pct: float, cy_pct: float) -> bool:
             PITCH_TOP_PCT  <= cy_pct <= PITCH_BOTTOM_PCT)
 
 
-def _ball_furniture_at_edge(x_px: float, y_px: float,
-                            edge_margin: float = BALL_FURNITURE_EDGE_MARGIN_PX
-                            ) -> bool:
-    """True when a fixed object is safer to drop: outside pitch or on its edge."""
-    if PITCH_POLYGON is None:
-        return False
-    dist = cv2.pointPolygonTest(
-        PITCH_POLYGON, (float(x_px), float(y_px)), True)
-    return dist < 0 or dist < edge_margin
-
-
 def suppress_static_ball_furniture(ball_history: list) -> tuple:
-    """Opt-in post-pass: drop pitch-edge furniture, not set-piece stillness.
-
-    Measured false positive: (907,166) hit 159/11204 times (1.4%) with
-    neighbours clustered — a goalpost, not the ball at rest mid-pitch.
-    """
+    """Opt-in post-pass: drop pitch-edge furniture, not set-piece stillness."""
+    import events as ev
     if not ball_history:
         return ball_history, 0, []
 
-    cell_pts: dict = defaultdict(list)
-    for rec in ball_history:
-        x_px, y_px = float(rec[2]), float(rec[3])
-        cell = (int(x_px) // BALL_CELL_PX, int(y_px) // BALL_CELL_PX)
-        cell_pts[cell].append((x_px, y_px))
-
-    n_total = len(ball_history)
-    min_hits = max(15, int(BALL_FURNITURE_MIN_FRAC * n_total))
-    banned: set = set()
-
-    for cell, pts in cell_pts.items():
-        if len(pts) < min_hits:
-            continue
-        xs, ys = zip(*pts)
-        if (float(np.std(xs)) > BALL_FURNITURE_MAX_SPREAD_PX
-                or float(np.std(ys)) > BALL_FURNITURE_MAX_SPREAD_PX):
-            continue
-        cx, cy = float(np.mean(xs)), float(np.mean(ys))
-        if not _ball_furniture_at_edge(cx, cy):
-            continue
-        banned.add(cell)
-
+    banned = ev.furniture_cells(
+        ball_history, PITCH_POLYGON,
+        cell_px=BALL_CELL_PX,
+        min_frac=BALL_FURNITURE_MIN_FRAC,
+        max_spread_px=BALL_FURNITURE_MAX_SPREAD_PX,
+        edge_margin=BALL_FURNITURE_EDGE_MARGIN_PX,
+    )
     if not banned:
         return ball_history, 0, []
 
@@ -2965,6 +2937,9 @@ def run_player_tracking(
     print(f"             {csv_paths['events']} ({cn['events']} events)")
     if em.get('counts_by_type'):
         print(f"  Events by type: {em['counts_by_type']}")
+    if em.get('furniture_cells'):
+        print(f"  Events: ignored {em['furniture_cells']} furniture cell(s), "
+              f"{em.get('skipped_touchline_or_side', 0)} touchline still-run(s)")
     if em.get('goals_note'):
         print(f"  Note: {em['goals_note']}")
 
