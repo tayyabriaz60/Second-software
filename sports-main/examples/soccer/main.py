@@ -307,11 +307,13 @@ TRACK_DETECT_FLOOR = 0.15
 # only 21% of hits inside the pitch with one static x band supplying 58% of them.
 BALL_MIN_CONF = 0.30
 BALL_CELL_PX = 64
-# Static furniture suppression is opt-in (--ball_static_suppress). Default off:
-# a real ball is often motionless before set pieces, and over an 18-min clip it
-# revisits every cell many times. The measured false positive was one spot
-# (907,166) at 1.4% of detections on the pitch edge — the opt-in filter targets
-# that pattern only, after the full pass, not online.
+BALL_HISTORY_FRAMES = 90
+# v12 rolling suppressor: a cell in >25% of recent ball-detection frames is
+# furniture (goalpost). Measured v12: 11,204 rows / 59,674 frames (19%).
+BALL_STATIC_FRACTION = 0.25
+# Per-frame accept floor on the winning candidate (after class + polygon filters).
+BALL_ACCEPT_MIN_CONF = 0.30
+# Static furniture post-pass is opt-in (--ball_static_suppress). Default off.
 BALL_STATIC_SUPPRESS = False
 BALL_FURNITURE_MIN_FRAC = 0.01       # >1% of all ball rows in the run
 BALL_FURNITURE_MAX_SPREAD_PX = 5.0   # immobile across the whole clip
@@ -2582,44 +2584,71 @@ def run_player_tracking(
             detections = detections[np.isin(detections.class_id, wanted)]
         return detections
 
+    # Frozen at pass-1 start. clean_detections() can disable PITCH_POLYGON for
+    # players mid-run; ball must keep the validated polygon or v12's ~19% frame
+    # rate blows out to ~80% ghost detections (v14: 48,469 rows).
+    _ball_pitch_polygon = (
+        np.asarray(PITCH_POLYGON, dtype=np.int32).copy()
+        if PITCH_POLYGON is not None else None)
+    _ball_recent = deque(maxlen=BALL_HISTORY_FRAMES)
+
     def get_ball(frame, raw=None):
         """The ball, with sanity checks the raw detections lack.
 
-        Measured over 33s of 14_09: 1473 ball detections above 0.30, in 1107 of
-        1800 frames, with 303 frames offering more than one. Only 309 of the
-        1473 were inside the pitch polygon, and a single 256px-wide x band held
-        853 of them — a goalpost, detected as a ball over and over.
+        Measured v12 on 14_08: 11,204 detections / 59,674 frames (19%).
+        Measured v14 after dropping the rolling suppressor + live polygon:
+        48,469 rows (81%) — mostly ghost ball class on furniture.
 
-          1. inside the pitch polygon — removed ~79% on this footage
-          2. one ball per frame — keep the most confident survivor
-          3. static furniture — opt-in post-pass only (--ball_static_suppress);
-             online suppression banned real balls at rest during set pieces.
+          1. class + conf >= BALL_MIN_CONF on every candidate
+          2. inside pitch (frozen polygon, else %-bounds) — ~79% removed
+          3. not in a rolling static hotspot (v12 furniture suppressor)
+          4. one ball per frame — keep the most confident survivor if it
+             still meets BALL_ACCEPT_MIN_CONF
+          5. opt-in post-pass furniture filter (--ball_static_suppress)
         """
         if not SHOW_BALL:
             return None
         d = detect_raw(frame) if raw is None else raw
-        if len(d) and d.confidence is not None:
-            d = d[d.confidence >= BALL_MIN_CONF]
-        if len(d) == 0 or d.class_id is None:
+        if len(d) == 0 or d.class_id is None or d.confidence is None:
             return None
-        b = d[d.class_id == BALL_CLASS_ID]
+        b = d[(d.class_id == BALL_CLASS_ID) & (d.confidence >= BALL_MIN_CONF)]
         if len(b) == 0:
             return None
 
         cx = (b.xyxy[:, 0] + b.xyxy[:, 2]) / 2
         cy = (b.xyxy[:, 1] + b.xyxy[:, 3]) / 2
+        cells = [(int(x) // BALL_CELL_PX, int(y) // BALL_CELL_PX)
+                 for x, y in zip(cx, cy)]
 
         keep = np.ones(len(b), dtype=bool)
-        if PITCH_POLYGON is not None:
+        if _ball_pitch_polygon is not None:
             keep &= np.array([
-                cv2.pointPolygonTest(PITCH_POLYGON, (float(x), float(y)),
+                cv2.pointPolygonTest(_ball_pitch_polygon, (float(x), float(y)),
                                      False) >= 0
-                for x, y in zip(cx, b.xyxy[:, 3])])
+                for x, y in zip(cx, cy)])
+        else:
+            xp = cx / max(video_info.width, 1) * 100.0
+            yp = cy / max(video_info.height, 1) * 100.0
+            keep &= np.array([
+                in_pitch_boundary(float(x), float(y))
+                for x, y in zip(xp, yp)])
+
+        if len(_ball_recent) >= BALL_HISTORY_FRAMES // 2:
+            seen = Counter(c for frame_cells in _ball_recent
+                           for c in set(frame_cells))
+            limit = BALL_STATIC_FRACTION * len(_ball_recent)
+            keep &= np.array([seen[c] < limit for c in cells])
+
+        # Record all candidates (before keep) so hotspots stay visible.
+        _ball_recent.append(cells)
 
         b = b[keep]
         if len(b) == 0:
             return None
-        return b[[int(np.argmax(b.confidence))]]
+        best = int(np.argmax(b.confidence))
+        if float(b.confidence[best]) < BALL_ACCEPT_MIN_CONF:
+            return None
+        return b[[best]]
 
     ball_history = []
     frame_seconds: dict = {}
@@ -2921,9 +2950,22 @@ def run_player_tracking(
                 print("  Static furniture filter (opt-in): skipped — no pitch "
                       "polygon (need edge test to avoid dropping set pieces)")
         ball_frames = len({r[0] for r in ball_history})
+        n_proc = max(len(frame_seconds), 1)
+        pct = 100.0 * ball_frames / n_proc
+        poly_note = ('frozen polygon' if _ball_pitch_polygon is not None
+                     else '%-bounds fallback')
         print(f"Ball tracking: {len(ball_history)} detection(s) in "
-              f"{ball_frames} frame(s)"
-              f"{'' if ball_history else ' — none passed filters; see ball.csv'}")
+              f"{ball_frames} frame(s) ({pct:.1f}% of {n_proc} processed) "
+              f"[{poly_note}, rolling static suppressor on]")
+        if ball_history:
+            confs = np.asarray([float(r[4]) for r in ball_history])
+            print(f"  Ball confidence: min={confs.min():.3f}  "
+                  f"median={float(np.median(confs)):.3f}  max={confs.max():.3f}")
+        else:
+            print("  — none passed filters")
+        if PITCH_POLYGON is None and _ball_pitch_polygon is not None:
+            print("  Note: player pitch polygon was disabled mid-run; ball kept "
+                  "the startup polygon")
 
     csv_paths = write_warehouse_csvs(
         source_video_path, fps, frame_seconds, identity_map,
