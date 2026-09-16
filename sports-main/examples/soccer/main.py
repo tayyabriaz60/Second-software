@@ -162,11 +162,34 @@ PLAYER_CLASS_ID     = 2
 REFEREE_CLASS_ID    = 3
 
 
-def sync_class_ids(model) -> None:
+def _model_names(model) -> Optional[dict]:
+    """Normalise Ultralytics class names (dict or list) to {index: name}."""
+    names = getattr(model, 'names', None)
+    if isinstance(names, list):
+        return {i: str(n) for i, n in enumerate(names)}
+    if isinstance(names, dict) and names:
+        return {int(k): str(v) for k, v in names.items()}
+    return None
+
+
+def _apply_panoramic_class_map() -> None:
+    """3-class finetune order from prepare_panoramic_dataset.py."""
+    global BALL_CLASS_ID, GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID
+    GOALKEEPER_CLASS_ID = 0
+    PLAYER_CLASS_ID     = 1
+    REFEREE_CLASS_ID    = 2
+    print("  Class IDs: panoramic 3-class map (goalkeeper=0, player=1, referee=2)")
+
+
+def sync_class_ids(model, model_path: str = None) -> None:
     """Point the class-ID globals at this model's own class names."""
     global BALL_CLASS_ID, GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID
-    names = getattr(model, 'names', None)
+    path = (model_path or PLAYER_DETECTION_MODEL_PATH or '').lower()
+    names = _model_names(model)
     if not names:
+        if 'panoramic' in path or 'yolo32x9' in path:
+            _apply_panoramic_class_map()
+            return
         print("  Class IDs: model exposes no class names, keeping defaults")
         return
 
@@ -617,14 +640,30 @@ class Mode(Enum):
 # HELPERS
 # ================================================================
 
+_player_model_cache: dict[tuple[str, str], YOLO] = {}
+
+
+def _is_onnx_weights(path: str) -> bool:
+    return str(path).lower().endswith('.onnx')
+
+
 def load_player_model(device: str):
     """Load the player/detection model and align class IDs with its own names.
 
     Every mode goes through here so a swapped-in custom model can't quietly
-    disagree with the hardcoded indices.
+    disagree with the hardcoded indices. ONNX weights are cached and are not
+    passed through .to(cuda) — ORT picks the execution provider itself.
     """
-    model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-    sync_class_ids(model)
+    path = PLAYER_DETECTION_MODEL_PATH
+    cache_key = (path, 'onnx' if _is_onnx_weights(path) else device)
+    if cache_key in _player_model_cache:
+        return _player_model_cache[cache_key]
+
+    model = YOLO(path)
+    if not _is_onnx_weights(path):
+        model = model.to(device=device)
+    sync_class_ids(model, path)
+    _player_model_cache[cache_key] = model
     return model
 
 
@@ -632,7 +671,8 @@ def yolo_predict_kwargs(conf: float) -> dict:
     """Shared Ultralytics predict args (imgsz + optional rect for 32:9)."""
     kw = dict(imgsz=INFERENCE_IMGSZ, conf=conf,
               agnostic_nms=True, verbose=False)
-    if INFERENCE_RECT:
+    # Fixed-shape ONNX exports already encode HxW; rect confuses ORT inference.
+    if INFERENCE_RECT and not _is_onnx_weights(PLAYER_DETECTION_MODEL_PATH):
         kw['rect'] = True
     return kw
 
@@ -3877,6 +3917,7 @@ if __name__ == '__main__':
         PITCH_POLYGON_PATH = args.pitch_polygon
     if args.model:
         PLAYER_DETECTION_MODEL_PATH = args.model
+        _player_model_cache.clear()
     if args.imgsz:
         if len(args.imgsz) == 1:
             INFERENCE_IMGSZ = args.imgsz[0]
