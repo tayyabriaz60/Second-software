@@ -260,6 +260,9 @@ MIN_BOX_WIDTH_PX = 8
 # so at 1280 the model was seeing them at ~19px and missing roughly 4 of the
 # 22 per frame. Costs about 2x runtime.
 INFERENCE_IMGSZ = 1920
+# When imgsz is [H, W] (32:9 panoramic), pass rect=True so inference does not
+# letterbox to square and crush far-touchline players back to ~5px tall.
+INFERENCE_RECT = False
 
 # Detection confidence floor. Ultralytics defaults to 0.25, which is right for
 # a model on footage it knows. A model applied to an unfamiliar ground/kit/light
@@ -625,6 +628,15 @@ def load_player_model(device: str):
     return model
 
 
+def yolo_predict_kwargs(conf: float) -> dict:
+    """Shared Ultralytics predict args (imgsz + optional rect for 32:9)."""
+    kw = dict(imgsz=INFERENCE_IMGSZ, conf=conf,
+              agnostic_nms=True, verbose=False)
+    if INFERENCE_RECT:
+        kw['rect'] = True
+    return kw
+
+
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
@@ -958,8 +970,7 @@ def _detect_raw_for_polygon(frame):
     except Exception:
         _m = load_player_model('cpu')
     return sv.Detections.from_ultralytics(
-        _m(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF,
-           agnostic_nms=True, verbose=False)[0])
+        _m(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0])
 
 
 def build_pitch_polygon_from_motion(source_video_path, frame_w, frame_h,
@@ -2511,7 +2522,7 @@ def run_player_detection(source_video_path: str, device: str,
     model      = load_player_model(device)
     video_info = sv.VideoInfo.from_video_path(source_video_path)
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
-        result     = model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -2570,9 +2581,8 @@ def run_player_tracking(
             # reach ByteTrack; activation (not this conf) decides new tracks.
             return rfdetr_onnx.detect(frame, conf=min(TRACK_DETECT_FLOOR,
                                                       BALL_MIN_CONF))
-        result = model(frame, imgsz=INFERENCE_IMGSZ,
-                       conf=min(TRACK_DETECT_FLOOR, BALL_MIN_CONF),
-                       agnostic_nms=True, verbose=False)[0]
+        result = model(frame, **yolo_predict_kwargs(
+            min(TRACK_DETECT_FLOOR, BALL_MIN_CONF)))[0]
         return sv.Detections.from_ultralytics(result)
 
     def get_player_detections(frame, raw=None):
@@ -3316,7 +3326,7 @@ def run_team_classification(source_video_path: str, device: str,
         video_frames(source_video_path, stride=STRIDE, max_frames=max_frames, start_frame=START_FRAME),
         desc='collecting crops'
     ):
-        result     = model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -3330,7 +3340,7 @@ def run_team_classification(source_video_path: str, device: str,
 
     tracker = sv.ByteTrack(minimum_consecutive_frames=1, lost_track_buffer=90)
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
-        result     = model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -3379,7 +3389,7 @@ def run_radar(source_video_path: str, device: str,
         video_frames(source_video_path, stride=STRIDE, max_frames=max_frames, start_frame=START_FRAME),
         desc='collecting crops'
     ):
-        result     = player_model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = player_model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -3395,7 +3405,7 @@ def run_radar(source_video_path: str, device: str,
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
         keypoints  = sv.KeyPoints.from_ultralytics(
             pitch_model(frame, verbose=False)[0])
-        result     = player_model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = player_model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -3455,7 +3465,7 @@ def run_full_analysis(source_video_path: str, device: str,
         video_frames(source_video_path, stride=STRIDE, max_frames=max_frames, start_frame=START_FRAME),
         desc='collecting crops'
     ):
-        result     = player_model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = player_model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -3490,7 +3500,7 @@ def run_full_analysis(source_video_path: str, device: str,
         secs       = round(frame_n / fps, 2)
         keypoints  = sv.KeyPoints.from_ultralytics(
             pitch_model(frame, verbose=False)[0])
-        result     = player_model(frame, imgsz=INFERENCE_IMGSZ, conf=INFERENCE_CONF, agnostic_nms=True, verbose=False)[0]
+        result     = player_model(frame, **yolo_predict_kwargs(INFERENCE_CONF))[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = clean_detections(
             detections, video_info.width, video_info.height)
@@ -3643,7 +3653,7 @@ def main(
                   f"clips the near half of the pitch still produces plausible "
                   f"detection counts.")
     print(f"Start frame: {START_FRAME}")
-    print(f"Detector: {DETECTOR}  imgsz: {INFERENCE_IMGSZ}  "
+    print(f"Detector: {DETECTOR}  imgsz: {INFERENCE_IMGSZ}  rect: {INFERENCE_RECT}  "
           f"detect_floor: {TRACK_DETECT_FLOOR}  "
           f"activation: {TRACK_ACTIVATION_THRESHOLD}  "
           f"match: {TRACK_MATCHING_THRESHOLD}  "
@@ -3761,10 +3771,13 @@ if __name__ == '__main__':
         help='Detection confidence floor (default 0.25). Lower it for footage '
              'the model was not trained on — it detects correctly but with low '
              'confidence, and the default silently discards everything.')
-    parser.add_argument('--imgsz', type=int, default=None,
-        help='Model input size. Higher recovers small players but costs runtime; '
-             'a wider source downscales harder, so 4096-wide footage needs more '
-             'than 3024-wide to give the model the same pixels.')
+    parser.add_argument('--imgsz', type=int, nargs='+', default=None,
+        metavar='N',
+        help='Model input size. One value = square letterbox (legacy). '
+             'Two values H W = aspect-correct 32:9 (e.g. 576 2048 for 4096x1152 '
+             'at 2x downsample); enables rect=True automatically.')
+    parser.add_argument('--rect', action='store_true',
+        help='Force rect=True at inference (auto when --imgsz is H W).')
     parser.add_argument('--max_frames', type=int, default=None,
         help='Process only the first N frames — useful for equal-length comparisons.')
     parser.add_argument('--no_render', action='store_true',
@@ -3865,7 +3878,15 @@ if __name__ == '__main__':
     if args.model:
         PLAYER_DETECTION_MODEL_PATH = args.model
     if args.imgsz:
-        INFERENCE_IMGSZ = args.imgsz
+        if len(args.imgsz) == 1:
+            INFERENCE_IMGSZ = args.imgsz[0]
+        elif len(args.imgsz) == 2:
+            INFERENCE_IMGSZ = list(args.imgsz)
+            INFERENCE_RECT = True
+        else:
+            raise SystemExit('--imgsz accepts one int (square) or two ints H W')
+    if args.rect:
+        INFERENCE_RECT = True
     if args.conf is not None:
         INFERENCE_CONF = args.conf
     if args.touchline_buffer is not None:

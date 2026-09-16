@@ -18,6 +18,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+# Anchor runs/ under sports-main/examples/soccer regardless of cwd (Ultralytics
+# otherwise nests under runs/detect/runs/panoramic/...).
+_SOCCER_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_RUNS = _SOCCER_ROOT / 'runs' / 'panoramic'
+
 # Stride-clean 32:9 pairs (multiples of 32 x multiples of 9 -> both divisible by 32)
 IMGSZ_PRESETS = {
     '2048x576': (576, 2048),   # 2x down from 4096x1152 — default
@@ -38,8 +43,10 @@ def main() -> None:
     ap.add_argument('--batch', type=int, default=4,
                     help='Reduce to 2 if OOM at 2048x576')
     ap.add_argument('--device', default='0')
-    ap.add_argument('--project', default='runs/panoramic')
-    ap.add_argument('--name', default='yolo32x9')
+    ap.add_argument('--project', type=Path, default=_DEFAULT_RUNS,
+                    help='Absolute parent for the run (default: soccer/runs/panoramic)')
+    ap.add_argument('--name', default='yolo32x9',
+                    help='Run subdir under --project')
     ap.add_argument('--patience', type=int, default=40)
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=42)
@@ -53,7 +60,10 @@ def main() -> None:
                          'Run prepare_panoramic_dataset.py first.')
 
     imgsz = list(IMGSZ_PRESETS[args.imgsz_preset])
+    project = args.project.resolve()
+    save_dir = project / args.name
     print(f'Training imgsz (h,w) = {imgsz}  preset={args.imgsz_preset}  rect=True')
+    print(f'Run dir            = {save_dir}')
     print('Do NOT use square 640 — that crushes far-touchline players to ~5px tall.')
 
     from ultralytics import YOLO
@@ -66,7 +76,7 @@ def main() -> None:
         rect=True,
         batch=args.batch,
         device=args.device,
-        project=args.project,
+        project=str(project),
         name=args.name,
         patience=args.patience,
         workers=args.workers,
@@ -94,8 +104,11 @@ def main() -> None:
         val=True,
     )
 
-    best_pt = Path(results.save_dir) / 'weights' / 'best.pt'
-    print(f'\nBest weights: {best_pt}')
+    save_dir = Path(results.save_dir).resolve()
+    best_pt = save_dir / 'weights' / 'best.pt'
+    print(f'\nSave dir    : {save_dir}')
+    print(f'Best weights: {best_pt}')
+    print(f'ONNX target : {save_dir / "weights" / "best.onnx"}')
 
     if args.no_export:
         return
