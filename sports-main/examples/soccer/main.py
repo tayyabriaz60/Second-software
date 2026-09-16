@@ -471,6 +471,10 @@ START_FRAME = 0
 # roughly 25 ids x 300k frames of coordinates.
 TRACK_DUMP = False
 
+# Log why each canonical track ends: was a detection still at that position
+# next frame? (ByteTrack / ReID drop diagnosis — not team colour / merger.)
+TRACK_DIAG = False
+
 # Fragment -> player identity assignment after pass 1 (assign_identities.py).
 # On: rendered labels, JSON and minimap use identity ids (1..K) that gather
 # every fragment of a player; valid_ids() stays as a diagnostic only.
@@ -1486,6 +1490,10 @@ class PlayerReIDTracker:
         self.collision_mints = 0        # should stay ~0 after v5 architecture
         self.reid_adopts = 0
         self.stale_map_purges = 0
+        # Fragment-end instrumentation (--track_diag).
+        self._diag_active_cids: set = set()
+        self._diag_last_state: dict = {}
+        self._diag_events: list = []
 
     def _next_free_id(self) -> int:
         """A canonical id not yet used by any track."""
@@ -1824,9 +1832,223 @@ class PlayerReIDTracker:
             self.id_path_px[cid] += step
         self.id_sample_pos[cid] = (cx, cy, self.frame_n)
 
+    @staticmethod
+    def _diag_box_iou(a, b) -> float:
+        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if inter <= 0:
+            return 0.0
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        denom = area_a + area_b - inter
+        return float(inter / denom) if denom > 0 else 0.0
+
+    def _diag_pack_pre(self, detections: sv.Detections):
+        if len(detections) == 0:
+            return {'xyxy': np.zeros((0, 4)), 'conf': np.zeros(0),
+                    'centres': np.zeros((0, 2))}
+        xyxy = detections.xyxy.astype(np.float64)
+        conf = (detections.confidence.astype(np.float64)
+                if detections.confidence is not None
+                else np.ones(len(detections), dtype=np.float64))
+        centres = np.column_stack([
+            (xyxy[:, 0] + xyxy[:, 2]) / 2,
+            (xyxy[:, 1] + xyxy[:, 3]) / 2,
+        ])
+        return {'xyxy': xyxy, 'conf': conf, 'centres': centres}
+
+    def _diag_match_pre_to_post(self, pre_box, post_xyxy, min_iou=0.25):
+        best_iou, best_j = 0.0, -1
+        for j in range(len(post_xyxy)):
+            iou = self._diag_box_iou(pre_box, post_xyxy[j])
+            if iou > best_iou:
+                best_iou, best_j = iou, j
+        return (best_j if best_iou >= min_iou else -1), best_iou
+
+    def _diag_record_drops(self, pre, raw_ids, canonical_ids, post_xyxy,
+                           reid_hits, id_map_before):
+        """Log each canonical id active last frame but not this frame."""
+        if not TRACK_DIAG:
+            return
+        new_active = set(int(c) for c in canonical_ids)
+        dropped = self._diag_active_cids - new_active
+        post_xyxy = np.asarray(post_xyxy, dtype=np.float64)
+        if len(post_xyxy) == 0:
+            post_xyxy = np.zeros((0, 4))
+
+        for cid in dropped:
+            st = self._diag_last_state.get(cid)
+            if not st:
+                continue
+            cx, cy = st['cx'], st['cy']
+            box_h = float(st.get('box_h') or MIN_BOX_HEIGHT_PX)
+            radius = max(float(MIN_BOX_HEIGHT_PX), 0.55 * box_h)
+
+            pre_centres = pre['centres']
+            if len(pre_centres) == 0:
+                nearest_idx, nearest_dist, nearest_iou = -1, None, 0.0
+            else:
+                dists = np.hypot(pre_centres[:, 0] - cx, pre_centres[:, 1] - cy)
+                nearest_idx = int(np.argmin(dists))
+                nearest_dist = float(dists[nearest_idx])
+                last_box = st.get('xyxy') or [cx - box_h / 4, cy - box_h,
+                                              cx + box_h / 4, cy]
+                nearest_iou = self._diag_box_iou(
+                    last_box, pre['xyxy'][nearest_idx])
+
+            det_at_position = (
+                nearest_idx >= 0 and nearest_dist is not None
+                and nearest_dist <= radius
+            )
+            cluster_count = int(np.sum(
+                np.hypot(pre_centres[:, 0] - cx, pre_centres[:, 1] - cy)
+                <= max(radius * 1.5, 60.0)
+            )) if len(pre_centres) else 0
+
+            event = {
+                'ended_cid': int(cid),
+                'last_frame': int(st['frame']),
+                'next_frame': int(self.frame_n),
+                'last_raw_id': int(st['raw_id']),
+                'last_cx': round(cx, 1),
+                'last_cy': round(cy, 1),
+                'box_h': round(box_h, 1),
+                'match_radius_px': round(radius, 1),
+                'det_at_position': bool(det_at_position),
+                'cluster_count': cluster_count,
+                'in_cluster': cluster_count >= 2,
+                'nearest_dist_px': (round(nearest_dist, 1)
+                                    if nearest_dist is not None else None),
+                'nearest_iou': round(float(nearest_iou), 3),
+            }
+
+            if not det_at_position:
+                event['outcome'] = 'no_det'
+            else:
+                conf = float(pre['conf'][nearest_idx])
+                event['nearest_conf'] = round(conf, 3)
+                event['low_conf'] = conf < TRACK_ACTIVATION_THRESHOLD
+                post_j, post_iou = self._diag_match_pre_to_post(
+                    pre['xyxy'][nearest_idx], post_xyxy)
+                event['post_match_iou'] = round(float(post_iou), 3)
+                if post_j < 0:
+                    event['outcome'] = 'det_not_in_bt_output'
+                else:
+                    post_cid = int(canonical_ids[post_j])
+                    post_raw = int(raw_ids[post_j])
+                    event['post_canonical'] = post_cid
+                    event['post_raw'] = post_raw
+                    if post_cid == cid:
+                        event['outcome'] = 'det_same_id'
+                    else:
+                        event['outcome'] = 'det_other_id'
+                        event['bytetrack_raw_switch'] = (
+                            post_raw != st['raw_id'])
+                        event['bytetrack_new_raw'] = (
+                            post_raw not in id_map_before)
+                        event['reid_reclaimed'] = post_j in reid_hits
+                        if post_j in reid_hits:
+                            event['reid_target_cid'] = int(reid_hits[post_j])
+
+            self._diag_events.append(event)
+
+        self._diag_active_cids = new_active
+        self._diag_last_state = {}
+        for i, cid in enumerate(canonical_ids):
+            cid = int(cid)
+            box = post_xyxy[i]
+            centres_i = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+            self._diag_last_state[cid] = {
+                'frame': int(self.frame_n),
+                'cx': float(centres_i[0]),
+                'cy': float(centres_i[1]),
+                'box_h': float(box[3] - box[1]),
+                'xyxy': [float(v) for v in box],
+                'raw_id': int(raw_ids[i]),
+            }
+
+    def print_track_diag_summary(self):
+        """Summarise fragment-end events collected during pass 1."""
+        ev = self._diag_events
+        print(f"\nTrack diag — canonical id drops ({len(ev)} fragment ends):")
+        print(f"  ByteTrack: match_thresh={TRACK_MATCHING_THRESHOLD}  "
+              f"lost_buffer={BYTE_TRACK_LOST_SECONDS}s "
+              f"({self.bt_lost_frames}f @ {self.fps:.1f}fps)  "
+              f"activation={TRACK_ACTIVATION_THRESHOLD}  "
+              f"detect_floor={TRACK_DETECT_FLOOR}  "
+              f"min_consecutive={TRACK_MIN_CONSECUTIVE_FRAMES}")
+        if not ev:
+            print("  (no drops recorded)")
+            return
+        n = len(ev)
+        present = [e for e in ev if e.get('det_at_position')]
+        absent = [e for e in ev if not e.get('det_at_position')]
+        print(f"  Detection at last position on next frame:")
+        print(f"    present: {len(present)} ({100*len(present)/n:.1f}%) "
+              f"— tracker chose to end despite detection")
+        print(f"    absent:  {len(absent)} ({100*len(absent)/n:.1f}%) "
+              f"— likely occlusion / no box")
+        if present:
+            other = sum(1 for e in present if e.get('outcome') == 'det_other_id')
+            not_out = sum(1 for e in present
+                          if e.get('outcome') == 'det_not_in_bt_output')
+            cluster = sum(1 for e in present if e.get('in_cluster'))
+            raw_sw = sum(1 for e in present if e.get('bytetrack_raw_switch'))
+            new_raw = sum(1 for e in present if e.get('bytetrack_new_raw'))
+            reid_ok = sum(1 for e in present if e.get('reid_reclaimed'))
+            low_c = sum(1 for e in present if e.get('low_conf'))
+            print(f"  Of detection-present ends:")
+            print(f"    assigned other canonical id: {other} "
+                  f"({100*other/len(present):.1f}%)")
+            print(f"    not in ByteTrack output:     {not_out}")
+            print(f"    cluster (≥2 dets nearby):    {cluster} "
+                  f"({100*cluster/len(present):.1f}%)")
+            print(f"    ByteTrack raw id switch:     {raw_sw}")
+            print(f"    brand-new ByteTrack raw id:  {new_raw}")
+            print(f"    ReID reclaimed detection:    {reid_ok}")
+            print(f"    nearest conf < activation:   {low_c}")
+
+    def save_track_diag_json(self, path: str, fps: float):
+        summary = {}
+        ev = self._diag_events
+        if ev:
+            present = [e for e in ev if e.get('det_at_position')]
+            summary = {
+                'fragment_ends': len(ev),
+                'det_present': len(present),
+                'det_absent': len(ev) - len(present),
+                'det_other_id': sum(1 for e in present
+                                    if e.get('outcome') == 'det_other_id'),
+                'in_cluster': sum(1 for e in present if e.get('in_cluster')),
+            }
+        payload = {
+            'fps': float(fps),
+            'params': {
+                'TRACK_MATCHING_THRESHOLD': TRACK_MATCHING_THRESHOLD,
+                'BYTE_TRACK_LOST_SECONDS': BYTE_TRACK_LOST_SECONDS,
+                'lost_track_buffer_frames': self.bt_lost_frames,
+                'TRACK_ACTIVATION_THRESHOLD': TRACK_ACTIVATION_THRESHOLD,
+                'TRACK_DETECT_FLOOR': TRACK_DETECT_FLOOR,
+                'TRACK_MIN_CONSECUTIVE_FRAMES': TRACK_MIN_CONSECUTIVE_FRAMES,
+                'REID_DUEL_RADIUS_FRAC': REID_DUEL_RADIUS_FRAC,
+            },
+            'summary': summary,
+            'events': self._diag_events,
+        }
+        with open(path, 'w') as f:
+            json.dump(payload, f, indent=2)
+        print(f"Track diag saved to: {path}")
+
     def update(self, detections: sv.Detections, frame=None) -> sv.Detections:
+        pre = self._diag_pack_pre(detections) if TRACK_DIAG else None
+        id_map_before = dict(self.id_map) if TRACK_DIAG else None
+
         detections = self.tracker.update_with_detections(detections)
         if detections.tracker_id is None or len(detections) == 0:
+            if TRACK_DIAG:
+                self._diag_record_drops(
+                    pre, [], [], np.zeros((0, 4)), {}, id_map_before)
             self.frame_n += 1
             return sv.Detections.empty()
 
@@ -2001,6 +2223,10 @@ class PlayerReIDTracker:
             class_id=detections.class_id,
             tracker_id=np.array(canonical_ids, dtype=int)
         )
+        if TRACK_DIAG:
+            self._diag_record_drops(
+                pre, raw_ids, canonical_ids, detections.xyxy,
+                reid_hits, id_map_before)
         self.frame_n += 1
         return detections
 
@@ -2771,6 +2997,49 @@ def run_player_tracking(
                     float(b.confidence[0])))
 
     raw_id_count = len(tracker1.id_frame_count)
+
+    # Pre-bridge gap stats — small internal holes vs long occlusions.
+    internal_gaps = []
+    for _cid, _hist in tracker1.id_history.items():
+        if len(_hist) < 2:
+            continue
+        _hist = sorted(_hist)
+        for _prev, _cur in zip(_hist, _hist[1:]):
+            _g = int(_cur[0] - _prev[0]) - 1
+            if _g > 0:
+                internal_gaps.append(_g)
+    _gaps_arr = np.asarray(internal_gaps, dtype=np.int64)
+    pre_bridge_gap_metrics = {
+        'internal_gaps':           int(len(_gaps_arr)),
+        'gaps_le_10_frames':       int((_gaps_arr <= 10).sum()) if len(_gaps_arr) else 0,
+        'gaps_gt_10_frames':       int((_gaps_arr > 10).sum()) if len(_gaps_arr) else 0,
+        'max_gap_frames':          int(_gaps_arr.max()) if len(_gaps_arr) else 0,
+        'median_frame_coverage':   0.0,
+    }
+    if internal_gaps:
+        _cov = []
+        for _cid, _hist in tracker1.id_history.items():
+            if len(_hist) < 2:
+                continue
+            _hist = sorted(_hist)
+            _span = int(_hist[-1][0] - _hist[0][0]) + 1
+            if _span > 0:
+                _cov.append(len(_hist) / _span)
+        pre_bridge_gap_metrics['median_frame_coverage'] = (
+            round(float(np.median(_cov)), 3) if _cov else 0.0)
+        print(f"\nPre-bridge fragment continuity:")
+        print(f"  median frame coverage : "
+              f"{pre_bridge_gap_metrics['median_frame_coverage']:.1%}")
+        print(f"  internal gaps         : "
+              f"{pre_bridge_gap_metrics['internal_gaps']} "
+              f"(≤10f: {pre_bridge_gap_metrics['gaps_le_10_frames']}, "
+              f">10f: {pre_bridge_gap_metrics['gaps_gt_10_frames']})")
+
+    if TRACK_DIAG:
+        tracker1.print_track_diag_summary()
+        _diag_path = output_path_for(source_video_path, 'track_diag')
+        tracker1.save_track_diag_json(_diag_path, fps=fps)
+
     n_bridged = tracker1.interpolate_short_gaps()
     if n_bridged:
         print(f"\nGap bridge: filled {n_bridged} missing sample(s) "
@@ -2865,6 +3134,7 @@ def run_player_tracking(
         'surviving_ge50pct':      int((frag_spans_arr >= 0.5 * clip_seconds).sum()) if clip_seconds and n_frags else 0,
         'surviving_ge50pct_frac': round(float((frag_spans_arr >= 0.5 * clip_seconds).mean()), 3) if n_frags and clip_seconds else 0.0,
         'clip_seconds':           round(clip_seconds, 1),
+        **pre_bridge_gap_metrics,
     }
     print(f"\nFragmentation metrics (pass 1, pre-merge):")
     print(f"  fragments           : {pass1_metrics['fragments']}")
@@ -3772,6 +4042,10 @@ if __name__ == '__main__':
     parser.add_argument('--track_dump', action='store_true',
         help='Save every id\'s per-frame position, for offline tracklet '
              'stitching with stitch_tracks.py.')
+    parser.add_argument('--track_diag', action='store_true',
+        help='At each fragment end, log whether a detection existed at that '
+             'position on the next frame (ByteTrack drop diagnosis). Writes '
+             'track_diag_<clip>_<run>.json alongside other id_lists outputs.')
     parser.add_argument('--no_assign', action='store_true',
         help='Skip fragment -> identity assignment; render raw fragment ids.')
     parser.add_argument('--identity_map', type=str, default=None,
@@ -3873,6 +4147,8 @@ if __name__ == '__main__':
         STITCH_KEEP_THIN = True
     if args.track_dump:
         TRACK_DUMP = True
+    if args.track_diag:
+        TRACK_DIAG = True
     if args.no_assign:
         ASSIGN_IDENTITIES = False
     if args.identity_map:
