@@ -4011,7 +4011,8 @@ def main(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Soccer AI Analysis')
     parser.add_argument('--source_video_path', type=str, required=True)
-    parser.add_argument('--target_video_path', type=str, required=True)
+    parser.add_argument('--target_video_path', type=str, default=None,
+        help='Output video path. Optional with --no_render (pass 1 / diag only).')
     parser.add_argument('--device',   type=str,  default='cpu')
     parser.add_argument('--mode',     type=Mode, default=Mode.PLAYER_DETECTION)
     parser.add_argument('--focus_id', type=int,  default=None,
@@ -4046,6 +4047,12 @@ if __name__ == '__main__':
         help='At each fragment end, log whether a detection existed at that '
              'position on the next frame (ByteTrack drop diagnosis). Writes '
              'track_diag_<clip>_<run>.json alongside other id_lists outputs.')
+    parser.add_argument('--bt_match', type=float, default=None,
+        help='ByteTrack minimum_matching_threshold (default 0.90). Try 0.85 '
+             'or 0.80 when diag shows raw-id switches under clustering.')
+    parser.add_argument('--bt_lost', type=float, default=None,
+        help='ByteTrack lost_track_buffer in seconds (default 0.75). Try 1.0–1.5 '
+             'to coast longer before a track is dropped.')
     parser.add_argument('--no_assign', action='store_true',
         help='Skip fragment -> identity assignment; render raw fragment ids.')
     parser.add_argument('--identity_map', type=str, default=None,
@@ -4135,6 +4142,10 @@ if __name__ == '__main__':
              'for generating a clean baseline dump to sweep '
              '--path_net_min_duration against offline afterward.')
     args = parser.parse_args()
+    if not args.no_render and not args.target_video_path:
+        parser.error('--target_video_path is required unless --no_render')
+    if args.no_render and not args.target_video_path:
+        args.target_video_path = '/tmp/no_render_skip.mp4'
     if args.grey_unstable:
         GREY_UNSTABLE = True
     if args.no_minimap:
@@ -4236,6 +4247,12 @@ if __name__ == '__main__':
         SPLIT_PATH_NET_WELDS = False
         print(f"  --no_path_net_split: split_path_net_welds disabled for "
               f"this run (clean baseline dump)")
+    if args.bt_match is not None:
+        TRACK_MATCHING_THRESHOLD = args.bt_match
+        print(f"  --bt_match: TRACK_MATCHING_THRESHOLD={TRACK_MATCHING_THRESHOLD}")
+    if args.bt_lost is not None:
+        BYTE_TRACK_LOST_SECONDS = args.bt_lost
+        print(f"  --bt_lost: BYTE_TRACK_LOST_SECONDS={BYTE_TRACK_LOST_SECONDS}s")
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
