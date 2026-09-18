@@ -474,6 +474,10 @@ TRACK_DUMP = False
 # Log why each canonical track ends: was a detection still at that position
 # next frame? (ByteTrack / ReID drop diagnosis — not team colour / merger.)
 TRACK_DIAG = False
+# Fragment-end "det present" gate: 1 body-height slack plus motion allowed
+# over the frame gap at MAX_BODY_HEIGHTS_PER_SEC (same scale as physics guard).
+# Old 0.55×box_h mis-labelled normal inter-frame motion as no_det.
+TRACK_DIAG_BASE_BODY_H = 1.0
 
 # Fragment -> player identity assignment after pass 1 (assign_identities.py).
 # On: rendered labels, JSON and minimap use identity ids (1..K) that gather
@@ -1866,6 +1870,18 @@ class PlayerReIDTracker:
                 best_iou, best_j = iou, j
         return (best_j if best_iou >= min_iou else -1), best_iou
 
+    def _diag_motion_match_radius_px(self, box_h: float, frame_gap: int) -> float:
+        """Px radius for track_diag only — not ByteTrack association.
+
+        radius_bh = TRACK_DIAG_BASE_BODY_H + MAX_BODY_HEIGHTS_PER_SEC × gap_sec
+        radius_px = radius_bh × box_h  (floor MIN_BOX_HEIGHT_PX)
+        """
+        bh = max(float(box_h), float(MIN_BOX_HEIGHT_PX))
+        gap = max(1, int(frame_gap))
+        gap_sec = gap / max(self.fps, 1e-6)
+        radius_bh = TRACK_DIAG_BASE_BODY_H + MAX_BODY_HEIGHTS_PER_SEC * gap_sec
+        return max(float(MIN_BOX_HEIGHT_PX), radius_bh * bh)
+
     def _diag_record_drops(self, pre, raw_ids, canonical_ids, post_xyxy,
                            reid_hits, id_map_before):
         """Log each canonical id active last frame but not this frame."""
@@ -1883,13 +1899,21 @@ class PlayerReIDTracker:
                 continue
             cx, cy = st['cx'], st['cy']
             box_h = float(st.get('box_h') or MIN_BOX_HEIGHT_PX)
-            radius = max(float(MIN_BOX_HEIGHT_PX), 0.55 * box_h)
+            frame_gap = max(1, int(self.frame_n - st['frame']))
+            radius = self._diag_motion_match_radius_px(box_h, frame_gap)
+            radius_bh = radius / max(box_h, float(MIN_BOX_HEIGHT_PX))
+            # Compare next-frame dets to motion-predicted position, not last centre.
+            if cid in self.last_seen:
+                ref_x, ref_y = self._pred_xy(cid, frames_ago=frame_gap)
+            else:
+                ref_x, ref_y = cx, cy
 
             pre_centres = pre['centres']
             if len(pre_centres) == 0:
                 nearest_idx, nearest_dist, nearest_iou = -1, None, 0.0
             else:
-                dists = np.hypot(pre_centres[:, 0] - cx, pre_centres[:, 1] - cy)
+                dists = np.hypot(pre_centres[:, 0] - ref_x,
+                                 pre_centres[:, 1] - ref_y)
                 nearest_idx = int(np.argmin(dists))
                 nearest_dist = float(dists[nearest_idx])
                 last_box = st.get('xyxy') or [cx - box_h / 4, cy - box_h,
@@ -1902,7 +1926,7 @@ class PlayerReIDTracker:
                 and nearest_dist <= radius
             )
             cluster_count = int(np.sum(
-                np.hypot(pre_centres[:, 0] - cx, pre_centres[:, 1] - cy)
+                np.hypot(pre_centres[:, 0] - ref_x, pre_centres[:, 1] - ref_y)
                 <= max(radius * 1.5, 60.0)
             )) if len(pre_centres) else 0
 
@@ -1913,13 +1937,20 @@ class PlayerReIDTracker:
                 'last_raw_id': int(st['raw_id']),
                 'last_cx': round(cx, 1),
                 'last_cy': round(cy, 1),
+                'ref_cx': round(ref_x, 1),
+                'ref_cy': round(ref_y, 1),
                 'box_h': round(box_h, 1),
+                'frame_gap': frame_gap,
                 'match_radius_px': round(radius, 1),
+                'match_radius_body_h': round(radius_bh, 3),
                 'det_at_position': bool(det_at_position),
                 'cluster_count': cluster_count,
                 'in_cluster': cluster_count >= 2,
                 'nearest_dist_px': (round(nearest_dist, 1)
                                     if nearest_dist is not None else None),
+                'nearest_dist_body_h': (
+                    round(nearest_dist / max(box_h, float(MIN_BOX_HEIGHT_PX)), 3)
+                    if nearest_dist is not None else None),
                 'nearest_iou': round(float(nearest_iou), 3),
             }
 
@@ -1984,11 +2015,12 @@ class PlayerReIDTracker:
         n = len(ev)
         present = [e for e in ev if e.get('det_at_position')]
         absent = [e for e in ev if not e.get('det_at_position')]
-        print(f"  Detection at last position on next frame:")
+        print(f"  Det within motion gate on next frame "
+              f"(≥{TRACK_DIAG_BASE_BODY_H}bh + {MAX_BODY_HEIGHTS_PER_SEC}bh/s×gap):")
         print(f"    present: {len(present)} ({100*len(present)/n:.1f}%) "
               f"— tracker chose to end despite detection")
         print(f"    absent:  {len(absent)} ({100*len(absent)/n:.1f}%) "
-              f"— likely occlusion / no box")
+              f"— no box within motion gate (occlusion / left frame)")
         if present:
             other = sum(1 for e in present if e.get('outcome') == 'det_other_id')
             not_out = sum(1 for e in present
@@ -2032,6 +2064,9 @@ class PlayerReIDTracker:
                 'TRACK_DETECT_FLOOR': TRACK_DETECT_FLOOR,
                 'TRACK_MIN_CONSECUTIVE_FRAMES': TRACK_MIN_CONSECUTIVE_FRAMES,
                 'REID_DUEL_RADIUS_FRAC': REID_DUEL_RADIUS_FRAC,
+                'TRACK_DIAG_MATCH_RADIUS': (
+                    f'{TRACK_DIAG_BASE_BODY_H}bh + '
+                    f'{MAX_BODY_HEIGHTS_PER_SEC}bh/s × gap_sec'),
             },
             'summary': summary,
             'events': self._diag_events,
