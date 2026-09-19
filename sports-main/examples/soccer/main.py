@@ -412,9 +412,10 @@ TEAM_CROP_STRIDE = 8
 # shadow-edge detection, while TRACK_DETECT_FLOOR still lets those boxes
 # CONTINUE an existing one. Reduces ID minting without starving association.
 TRACK_ACTIVATION_THRESHOLD = 0.45
-# Matching gate for associating a detection with an existing track; higher is
-# more permissive. With a SHORT ByteTrack lost buffer (see BYTE_TRACK_LOST_SECONDS),
-# association is IoU-local; 0.90 is the continuity/switch trade-off for RF-DETR jitter.
+# ByteTrack minimum_matching_threshold: minimum IoU to associate a detection
+# with an existing track. LOWER = more permissive (needed when inter-frame
+# motion drops IoU to ~0.5–0.6). HIGHER = stricter. Default 0.90 rejects
+# obvious same-player matches on moving boxes — sweep with --bt_match.
 TRACK_MATCHING_THRESHOLD = 0.90
 # Require two hits before a brand-new ByteTrack id is emitted. Single-frame
 # RF-DETR flicker (tree shadow, duplicate query) was minting throwaway ids that
@@ -3998,11 +3999,13 @@ def main(
                   f"clips the near half of the pitch still produces plausible "
                   f"detection counts.")
     print(f"Start frame: {START_FRAME}")
+    print(f"ByteTrack (this run): minimum_matching_threshold={TRACK_MATCHING_THRESHOLD} "
+          f"(min IoU det→track; lower=more permissive)  "
+          f"lost_track_buffer={BYTE_TRACK_LOST_SECONDS}s  "
+          f"(override with --bt_match / --bt_lost; echoed again in track_diag)")
     print(f"Detector: {DETECTOR}  imgsz: {INFERENCE_IMGSZ}  rect: {INFERENCE_RECT}  "
           f"detect_floor: {TRACK_DETECT_FLOOR}  "
           f"activation: {TRACK_ACTIVATION_THRESHOLD}  "
-          f"match: {TRACK_MATCHING_THRESHOLD}  "
-          f"bt_lost: {BYTE_TRACK_LOST_SECONDS}s  "
           f"reid: {REID_WINDOW_SECONDS}s  "
           f"min_frames: {MIN_SECONDS_TO_KEEP}s  "
           f"reid_min_lost: {REID_MIN_LOST_FRAMES}f  "
@@ -4083,11 +4086,12 @@ if __name__ == '__main__':
              'position on the next frame (ByteTrack drop diagnosis). Writes '
              'track_diag_<clip>_<run>.json alongside other id_lists outputs.')
     parser.add_argument('--bt_match', type=float, default=None,
-        help='ByteTrack minimum_matching_threshold (default 0.90). Try 0.85 '
-             'or 0.80 when diag shows raw-id switches under clustering.')
+        help='Override TRACK_MATCHING_THRESHOLD — ByteTrack minimum IoU to match '
+             'a detection to a track (default 0.90). Lower is more permissive; '
+             'sweep 0.70, 0.50 when diag shows dets present but IoU ~0.5–0.6.')
     parser.add_argument('--bt_lost', type=float, default=None,
-        help='ByteTrack lost_track_buffer in seconds (default 0.75). Try 1.0–1.5 '
-             'to coast longer before a track is dropped.')
+        help='Override BYTE_TRACK_LOST_SECONDS — ByteTrack lost_track_buffer in '
+             'seconds (default 0.75). Echoed at startup with --bt_match.')
     parser.add_argument('--no_assign', action='store_true',
         help='Skip fragment -> identity assignment; render raw fragment ids.')
     parser.add_argument('--identity_map', type=str, default=None,
@@ -4284,10 +4288,16 @@ if __name__ == '__main__':
               f"this run (clean baseline dump)")
     if args.bt_match is not None:
         TRACK_MATCHING_THRESHOLD = args.bt_match
-        print(f"  --bt_match: TRACK_MATCHING_THRESHOLD={TRACK_MATCHING_THRESHOLD}")
+        print(f"  --bt_match: TRACK_MATCHING_THRESHOLD={TRACK_MATCHING_THRESHOLD} "
+              f"(ByteTrack minimum_matching_threshold / min IoU)")
     if args.bt_lost is not None:
         BYTE_TRACK_LOST_SECONDS = args.bt_lost
-        print(f"  --bt_lost: BYTE_TRACK_LOST_SECONDS={BYTE_TRACK_LOST_SECONDS}s")
+        print(f"  --bt_lost: BYTE_TRACK_LOST_SECONDS={BYTE_TRACK_LOST_SECONDS}s "
+              f"(ByteTrack lost_track_buffer seconds)")
+    if args.mode == Mode.PLAYER_TRACKING:
+        print(f"  ByteTrack CLI state: minimum_matching_threshold="
+              f"{TRACK_MATCHING_THRESHOLD}  lost_track_buffer="
+              f"{BYTE_TRACK_LOST_SECONDS}s")
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
