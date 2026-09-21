@@ -607,7 +607,8 @@ PITCH_POLYGON_FAIL_DISABLE = 20
 CONTAINMENT_THRESHOLD = 0.90   # fraction of the smaller box inside the larger
 # ================================================================
 
-COLORS = ['#FF1493', '#00BFFF', '#FF6347', '#FFD700']
+# ref, team0 sky, team1 navy, GK gold, unmapped grey
+COLORS = ['#FF1493', '#00BFFF', '#000080', '#FFD700', '#808080']
 
 VERTEX_LABEL_ANNOTATOR = sv.VertexLabelAnnotator(
     color=[sv.Color.from_hex(c) for c in CONFIG.colors],
@@ -3244,7 +3245,8 @@ def run_player_tracking(
                       f">=60s: {s['identities_over_60s']}  "
                       f"links={s['total_links']} "
                       f"(low-confidence {s['low_confidence_links']})  "
-                      f"physics-refused={s['physics_refusals']}  "
+                      f"overlap-refused={s.get('overlap_refusals', 0)}  "
+                      f"physics-refused={s.get('physics_guard_refusals', s['physics_refusals'])}  "
                       f"max path/net={s['max_path_net_ratio']}")
                 if s['identities_over_path_net_ceiling']:
                     print(f"  WARNING: {s['identities_over_path_net_ceiling']} "
@@ -3516,9 +3518,10 @@ def run_player_tracking(
             if rid not in render_team:
                 render_team[int(rid)] = int(team)
 
-    # Palette indices into COLORS (team 0/1 align with minimap light-blue / red).
+    # Palette indices into COLORS (team 0/1 align with minimap sky / navy).
     _TEAM0_IDX, _TEAM1_IDX = 1, 2
-    _REF_IDX, _GK_IDX, _UNK_IDX = 0, 3, 3
+    _REF_IDX, _GK_IDX, _GREY_IDX, _UNK_IDX = 0, 3, 4, 4
+    identity_last_pos: dict[int, tuple[float, float]] = {}
 
     def _ellipse_color_lookup(dets):
         out = []
@@ -3542,16 +3545,18 @@ def run_player_tracking(
 
     for frame in video_frames(source_video_path, max_frames=max_frames, start_frame=START_FRAME):
         rec = frame_boxes.get(frame_n)
+        raw_cids = np.array([], dtype=int)
         if rec is None:
             detections = sv.Detections.empty()
         else:
             ids, xyxy, cls = rec
+            raw_cids = np.asarray(ids, dtype=int)
             detections = sv.Detections(
                 xyxy=xyxy,
                 # annotators colour by class and reject class_id=None
                 class_id=(cls if cls is not None
                           else np.full(len(ids), PLAYER_CLASS_ID, dtype=int)),
-                tracker_id=np.array([final_id(int(c), frame_n) for c in ids],
+                tracker_id=np.array([final_id(int(c), frame_n) for c in raw_cids],
                                     dtype=int))
         annotated  = frame.copy()
         ball = ball_by_frame.get(frame_n)
@@ -3570,8 +3575,11 @@ def run_player_tracking(
         n_detected = len(detections) if detections.tracker_id is not None else 0
         n_stable = 0
         if detections.tracker_id is not None and len(detections) > 0:
+            if frag2pid:
+                n_stable = int(sum(int(c) in frag2pid for c in raw_cids))
+            else:
+                n_stable = int(np.isin(detections.tracker_id, list(good_ids)).sum())
             valid_mask = np.isin(detections.tracker_id, list(good_ids))
-            n_stable = int(valid_mask.sum())
             if GREY_UNSTABLE:
                 # Review mode: only roster ids get colour + number.
                 unstable   = detections[~valid_mask]
@@ -3624,8 +3632,56 @@ def run_player_tracking(
                         col   = tuple(int(c * alpha) for c in FOCUS_COLOUR)
                         cv2.line(annotated, trail[j-1], trail[j], col, 2)
             else:
-                labels       = [f"#{int(tid)}" for tid in detections.tracker_id]
+                n = len(detections)
+                centers = np.column_stack([
+                    (detections.xyxy[:, 0] + detections.xyxy[:, 2]) * 0.5,
+                    (detections.xyxy[:, 1] + detections.xyxy[:, 3]) * 0.5,
+                ])
+                grey_mask = np.zeros(n, dtype=bool)
+                labels = [''] * n
+                mapped_pid: list[int | None] = []
+                for i in range(n):
+                    raw = int(raw_cids[i])
+                    if frag2pid is not None and raw not in frag2pid:
+                        grey_mask[i] = True
+                        mapped_pid.append(None)
+                    else:
+                        mapped_pid.append(int(detections.tracker_id[i]))
+
+                by_pid: dict[int, list[int]] = defaultdict(list)
+                for i, pid in enumerate(mapped_pid):
+                    if pid is not None:
+                        by_pid[pid].append(i)
+
+                for pid, idxs in by_pid.items():
+                    if len(idxs) == 1:
+                        i = idxs[0]
+                        labels[i] = f"#{pid}"
+                        identity_last_pos[pid] = (
+                            float(centers[i, 0]), float(centers[i, 1]))
+                    else:
+                        last = identity_last_pos.get(pid)
+                        if last is None:
+                            winner = idxs[0]
+                        else:
+                            winner = min(
+                                idxs,
+                                key=lambda j: float(np.hypot(
+                                    centers[j, 0] - last[0],
+                                    centers[j, 1] - last[1])))
+                        for i in idxs:
+                            if i == winner:
+                                labels[i] = f"#{pid}"
+                                identity_last_pos[pid] = (
+                                    float(centers[i, 0]), float(centers[i, 1]))
+                            else:
+                                grey_mask[i] = True
+                                labels[i] = ''
+
                 color_lookup = _ellipse_color_lookup(detections)
+                for i in range(n):
+                    if grey_mask[i]:
+                        color_lookup[i] = _GREY_IDX
                 annotated = ELLIPSE_ANNOTATOR.annotate(
                     annotated, detections, custom_color_lookup=color_lookup)
                 annotated = ELLIPSE_LABEL_ANNOTATOR.annotate(
@@ -3634,13 +3690,14 @@ def run_player_tracking(
 
         # HUD: only numbers computed this run — no temporal-stability claim.
         id_count_label = "Identities" if frag2pid else "Track IDs"
+        frag_med = pass1_metrics['median_span_s']
         hud_text = (
             f"Players: {n_detected}  |  Mapped: {n_stable}  |  "
             f"{id_count_label}: {len(good_ids)}  |  "
-            f"Fragments: {pass1_metrics['fragments']}  "
-            f"(med {pass1_metrics['median_span_s']}s)"
+            f"Fragments: {pass1_metrics['fragments']}  |  "
+            f"fragment median {frag_med:.1f}s"
         )
-        cv2.rectangle(annotated, (0, 0), (780, 36), (0, 0, 0), -1)
+        cv2.rectangle(annotated, (0, 0), (920, 36), (0, 0, 0), -1)
         cv2.putText(annotated, hud_text,
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.65, (255, 255, 255), 1)

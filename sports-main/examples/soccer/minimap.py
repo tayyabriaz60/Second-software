@@ -53,7 +53,7 @@ PANEL_FRACTION = 0.30           # panel width as a fraction of the frame width
 # of having a panel you can read at a glance.
 PANEL_ALPHA = 0.90
 
-TEAM_COLOURS = [(235, 180, 60), (70, 90, 240)]      # BGR: light blue, red
+TEAM_COLOURS = [(235, 180, 60), (128, 0, 0)]        # BGR: sky blue, navy (#000080)
 REFEREE_COLOUR = (60, 230, 235)
 KEEPER_COLOUR = (120, 235, 120)
 BALL_COLOUR = (0, 255, 255)

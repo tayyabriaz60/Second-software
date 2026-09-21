@@ -99,6 +99,27 @@ THRESHOLDS = [0.35, 0.55, 0.75, 0.95, 1.15]
 CHAIN_TELEPORT_BH_PER_SEC = 9.0   # == main.py MAX_BODY_HEIGHTS_PER_SEC
 CHAIN_SPEED_WINDOW_SECONDS = 0.20  # == main.py SPEED_WINDOW_SECONDS
 CHAIN_PATH_NET_CEILING = 25.0      # == main.py WELD_PATH_NET_CEILING
+# Two fragments alive on the same frames cannot be one person — refuse merges
+# when their frame sets share more than this many frames (not just touch).
+OVERLAP_FORBID_FRAMES = 3
+
+
+def frame_overlap_count(a: 'Fragment', b: 'Fragment') -> int:
+    return int(len(np.intersect1d(a.frames, b.frames)))
+
+
+def chain_temporal_overlap(
+        frags: List['Fragment'],
+        min_overlap: int = OVERLAP_FORBID_FRAMES) -> Optional[str]:
+    """None if no pair overlaps by > min_overlap frames; else reason string."""
+    frags = list(frags)
+    for i in range(len(frags)):
+        for j in range(i + 1, len(frags)):
+            n = frame_overlap_count(frags[i], frags[j])
+            if n > min_overlap:
+                return (f"temporal overlap {n} frames between frag "
+                        f"{frags[i].id} and {frags[j].id}")
+    return None
 
 
 @dataclass
@@ -443,17 +464,25 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
         ri, rj = root(i), root(j)
         if ri == rj:
             continue
+        combined = chains[i].frags + chains[j].frags
         # Re-validate the CANDIDATE combined chain before committing — cost
         # alone judges the join, not the resulting whole track. This is what
         # was missing: Pass 1 cuts a weld apart on this same evidence, but
         # nothing downstream re-checked what stitching it back together.
-        reason = physics_guard(chains[i].frags + chains[j].frags, fps,
-                               path_net_ceiling)
+        reason = chain_temporal_overlap(combined)
         if reason is not None:
             refused.append({
                 'from': chains[i].tail.id, 'to': chains[j].head.id,
                 'cost': round(float(c), 3), 'threshold': threshold,
-                'reason': reason,
+                'reason': reason, 'kind': 'overlap',
+            })
+            continue
+        reason = physics_guard(combined, fps, path_net_ceiling)
+        if reason is not None:
+            refused.append({
+                'from': chains[i].tail.id, 'to': chains[j].head.id,
+                'cost': round(float(c), 3), 'threshold': threshold,
+                'reason': reason, 'kind': 'physics',
             })
             continue
         merges.append((i, j, c, margin))
@@ -462,7 +491,8 @@ def _assign_round(chains: List[Chain], fps, hmodel, team_sep, threshold,
         parent[rj] = ri
 
     for r in refused:
-        print(f"    physics guard REFUSED frag {r['from']} -> {r['to']} "
+        tag = 'overlap' if r.get('kind') == 'overlap' else 'physics guard'
+        print(f"    {tag} REFUSED frag {r['from']} -> {r['to']} "
               f"(cost {r['cost']}, thr {r['threshold']:.2f}): {r['reason']}")
 
     if not merges:
@@ -561,6 +591,10 @@ def summarise(chains: List[Chain], fps: float, total_frames: int,
         'identities_over_path_net_ceiling': int(
             (ratios > path_net_ceiling).sum()) if len(ratios) else 0,
         'physics_refusals': len(refused or []),
+        'overlap_refusals': sum(
+            1 for r in (refused or []) if r.get('kind') == 'overlap'),
+        'physics_guard_refusals': sum(
+            1 for r in (refused or []) if r.get('kind') == 'physics'),
     }
 
 
