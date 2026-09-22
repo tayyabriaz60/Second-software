@@ -66,16 +66,23 @@ def box_from_centre_h(cx: float, cy: float, h: float,
     return x1, y1, x2, y2
 
 
-def torso_crop(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
-    """15–60% box height, middle 60% width."""
+def torso_crop(
+    frame: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    width_margin: float = 0.10,
+) -> np.ndarray:
+    """15–60% box height; default middle 80% of box width (10%–90%)."""
     fh, fw = frame.shape[:2]
     x1 = max(0, min(x1, fw - 1))
     x2 = max(x1 + 1, min(x2, fw))
     y1 = max(0, min(y1, fh - 1))
     y2 = max(y1 + 1, min(y2, fh))
     bw, bh = x2 - x1, y2 - y1
-    tx1 = x1 + int(0.20 * bw)
-    tx2 = x1 + int(0.80 * bw)
+    tx1 = x1 + int(width_margin * bw)
+    tx2 = x1 + int((1.0 - width_margin) * bw)
     ty1 = y1 + int(0.15 * bh)
     ty2 = y1 + int(0.60 * bh)
     if tx2 <= tx1 or ty2 <= ty1:
@@ -101,6 +108,51 @@ def parse_jersey_number(text: str) -> int | None:
     return None
 
 
+def merge_split_digit_boxes(
+        raw: list[tuple[list, str, float]]) -> list[tuple[str, float]]:
+    """Join left-to-right digit boxes on the same text line (e.g. '1' + '0' -> '10')."""
+    cells = []
+    for bbox, text, conf in raw:
+        digits = re.sub(r'\D', '', text or '')
+        if not digits:
+            continue
+        xs = [float(p[0]) for p in bbox]
+        ys = [float(p[1]) for p in bbox]
+        cells.append({
+            'xmin': min(xs),
+            'xmax': max(xs),
+            'cy': sum(ys) / len(ys),
+            'h': max(max(ys) - min(ys), 1.0),
+            'digits': digits,
+            'conf': float(conf),
+        })
+    if not cells:
+        return []
+    cells.sort(key=lambda c: (round(c['cy'] / c['h']), c['xmin']))
+    groups: list[list[dict]] = []
+    for c in cells:
+        placed = False
+        for g in groups:
+            gcy = sum(x['cy'] for x in g) / len(g)
+            gh = max(x['h'] for x in g)
+            if abs(c['cy'] - gcy) > 0.55 * max(c['h'], gh):
+                continue
+            gap = c['xmin'] - max(x['xmax'] for x in g)
+            if gap <= max(0.45 * max(c['h'], gh), 10.0):
+                g.append(c)
+                placed = True
+                break
+        if not placed:
+            groups.append([c])
+    merged: list[tuple[str, float]] = []
+    for g in groups:
+        g.sort(key=lambda c: c['xmin'])
+        text = ''.join(c['digits'] for c in g)
+        conf = sum(c['conf'] for c in g) / len(g)
+        merged.append((text, conf))
+    return merged
+
+
 class OcrEngine:
     def __init__(self, gpu: bool):
         self._reader = None
@@ -112,17 +164,25 @@ class OcrEngine:
         import easyocr
         self._reader = easyocr.Reader(['en'], gpu=self._gpu, verbose=False)
 
-    def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float]]:
+    def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float, str]]:
+        """Returns (jersey number, confidence, raw merged digit string)."""
         self._lazy_init()
         if bgr.size == 0:
             return []
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        out: list[tuple[int, float]] = []
-        for _bbox, text, conf in self._reader.readtext(
-                rgb, allowlist='0123456789', paragraph=False):
-            num = parse_jersey_number(text)
-            if num is not None:
-                out.append((num, float(conf)))
+        raw = self._reader.readtext(
+            rgb, allowlist='0123456789', paragraph=False, detail=1)
+        out: list[tuple[int, float, str]] = []
+        seen: set[tuple[int, float]] = set()
+        for merged_text, conf in merge_split_digit_boxes(raw):
+            num = parse_jersey_number(merged_text)
+            if num is None:
+                continue
+            key = (num, round(conf, 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((num, float(conf), merged_text))
         return out
 
 
@@ -579,6 +639,12 @@ def main() -> None:
                     help='Torso crop upscale (2–3 typical)')
     ap.add_argument('--width-frac', type=float, default=0.45,
                     help='Estimated box width as fraction of height')
+    ap.add_argument('--torso-width-margin', type=float, default=0.10,
+                    help='Fraction trimmed from each side of box width for torso '
+                         'crop (0.10 = middle 80%%)')
+    ap.add_argument('--replay-report', type=Path, default=None,
+                    help='Re-probe the same fragment ids as a prior '
+                         'jersey_ocr_report.json; contact sheet keeps that order')
     ap.add_argument('--cpu', action='store_true',
                     help='EasyOCR on CPU (default: GPU)')
     ap.add_argument('--contact-n', type=int, default=40)
@@ -606,7 +672,20 @@ def main() -> None:
         referee_class=args.referee_class)
 
     n_eligible_total = len(eligible)
-    if args.max_fragments and len(eligible) > args.max_fragments:
+    replay_ids: list[int] | None = None
+    if args.replay_report:
+        prior = json.loads(args.replay_report.read_text(encoding='utf-8'))
+        replay_ids = [int(f['fragment_id']) for f in prior.get('fragments', [])]
+        want = set(replay_ids)
+        eligible = [e for e in eligible if int(e['id']) in want]
+        order = {fid: i for i, fid in enumerate(replay_ids)}
+        eligible.sort(key=lambda e: order.get(int(e['id']), 10**9))
+        missing = want - {int(e['id']) for e in eligible}
+        if missing:
+            print(f'  replay-report: {len(missing)} id(s) not eligible now: '
+                  f'{sorted(missing)[:20]}...')
+
+    if args.max_fragments and len(eligible) > args.max_fragments and not replay_ids:
         rng = random.Random(args.seed)
         eligible = rng.sample(eligible, args.max_fragments)
 
@@ -679,18 +758,22 @@ def main() -> None:
                 continue
             cx, cy, h = sample_centre_and_height(tr, si, hs)
             x1, y1, x2, y2 = box_from_centre_h(cx, cy, h, args.width_frac)
-            crop = torso_crop(frame, x1, y1, x2, y2)
+            crop = torso_crop(
+                frame, x1, y1, x2, y2, width_margin=args.torso_width_margin)
             up = upscale(crop, args.upscale)
             reads = ocr.read_digits(up)
-            for num, conf in reads:
+            for num, conf, _raw in reads:
                 all_reads.append((num, conf))
             per_sample.append({
                 'frame': fnum,
                 'h': h,
-                'reads': [{'number': n, 'confidence': round(c, 3)} for n, c in reads],
+                'reads': [
+                    {'number': n, 'confidence': round(c, 3), 'raw_digits': raw}
+                    for n, c, raw in reads
+                ],
             })
-            if reads and max(c for _, c in reads) > best_conf:
-                best_conf = max(c for _, c in reads)
+            if reads and max(c for _, c, _ in reads) > best_conf:
+                best_conf = max(c for _, c, _ in reads)
                 best_crop = up.copy()
 
         consistent, maj, maj_count, n_reads = is_consistent(all_reads)
@@ -770,10 +853,14 @@ def main() -> None:
         json.dumps(json_safe(payload), indent=2), encoding='utf-8')
     print(f'\n  Report: {report_path}')
 
-    rng = random.Random(args.seed)
     contact_pool = [r for r in results if r['_thumb'] is not None]
-    contact_pick = rng.sample(
-        contact_pool, min(args.contact_n, len(contact_pool)))
+    if replay_ids:
+        by_id = {r['fragment_id']: r for r in contact_pool}
+        contact_pick = [by_id[fid] for fid in replay_ids if fid in by_id]
+    else:
+        rng = random.Random(args.seed)
+        contact_pick = rng.sample(
+            contact_pool, min(args.contact_n, len(contact_pool)))
     contact_entries = []
     for r in contact_pick:
         thumb = overlay_read_on_crop(r['_thumb'], r['_overlay'])
