@@ -30,7 +30,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-REFEREE_CLASS_ID = 2
+# Fallback when the dump has no class map (RF-DETR / main.py defaults:
+# ball=0, goalkeeper=1, player=2, referee=3).
+FALLBACK_REFEREE_CLASS_ID = 3
+
+_HEIGHT_KEYS = (
+    'box_height_px', 'box_heights', 'box_h', 'h', 'heights',
+    'height_px', 'height',
+)
 
 
 def _spread_indices(idxs: list[int], k: int) -> list[int]:
@@ -134,21 +141,296 @@ def is_consistent(reads: list[tuple[int, float]]) -> tuple[bool, int | None, int
     return ok, maj, count, n
 
 
+def _scale_heights_to_px(vals: list[float], frame_h: float) -> list[float]:
+    if not vals or frame_h <= 0:
+        return vals
+    mx = max(vals)
+    if mx <= 0:
+        return vals
+    # Normalised fraction of frame height (0..1).
+    if mx <= 1.0:
+        return [v * frame_h for v in vals]
+    return vals
+
+
+def _infer_imgsz_height(dump: dict) -> float | None:
+    raw = dump.get('inference_imgsz') or dump.get('infer_imgsz')
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)) and raw:
+        return float(raw[0])
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scale_heights_infer_to_video(
+        vals: list[float], frame_h: float, dump: dict) -> list[float]:
+    """Heights from 576-tall inference space -> native video height."""
+    vals = _scale_heights_to_px(vals, frame_h)
+    if not vals or frame_h <= 0:
+        return vals
+    ih = _infer_imgsz_height(dump)
+    if ih is None or ih <= 0 or ih >= frame_h:
+        return vals
+    mx = max(vals)
+    # Native near-touchline boxes often exceed ~250px; infer-space tops out ~140.
+    if mx > 0 and mx < frame_h * 0.22:
+        scale = frame_h / ih
+        return [v * scale for v in vals]
+    return vals
+
+
+def _looks_like_cxcywh(p: list) -> bool:
+    if len(p) < 4:
+        return False
+    cx, cy, w, h = (float(p[0]), float(p[1]), float(p[2]), float(p[3]))
+    if w <= 0 or h <= 0:
+        return False
+    if w >= cx and h >= cy:
+        return False
+    if w > 800 or h > 800:
+        return False
+    return True
+
+
+def _heights_from_xyxy(tr: dict, n: int) -> list[float] | None:
+    xyxy = tr.get('xyxy') or tr.get('boxes') or tr.get('bbox')
+    if isinstance(xyxy, list) and len(xyxy) > 0 and n > 0:
+        out = []
+        for row in xyxy[:n]:
+            if not row or len(row) < 4:
+                out.append(0.0)
+            elif _looks_like_cxcywh(row):
+                out.append(float(row[3]))
+            else:
+                out.append(abs(float(row[3]) - float(row[1])))
+        out.extend([0.0] * max(0, n - len(out)))
+        if max(out, default=0) > 0:
+            return out[:n]
+    xy = tr.get('xy')
+    if isinstance(xy, list) and len(xy) > 0 and n > 0 and len(xy[0]) >= 4:
+        out = []
+        for p in xy[:n]:
+            if _looks_like_cxcywh(p):
+                out.append(float(p[3]))
+            else:
+                out.append(abs(float(p[3]) - float(p[1])))
+        out.extend([0.0] * max(0, n - len(out)))
+        if max(out, default=0) > 0:
+            return out[:n]
+    return None
+
+
+def _heights_from_record_list(tr: dict, n: int) -> list[float] | None:
+    for key in ('history', 'records', 'samples'):
+        recs = tr.get(key)
+        if not isinstance(recs, list) or len(recs) < n:
+            continue
+        out = []
+        for rec in recs[:n]:
+            if not isinstance(rec, dict):
+                out.append(0.0)
+                continue
+            h = None
+            for hk in _HEIGHT_KEYS:
+                if rec.get(hk) not in (None, ''):
+                    h = float(rec[hk])
+                    break
+            if h is None and rec.get('xyxy') and len(rec['xyxy']) >= 4:
+                h = abs(float(rec['xyxy'][3]) - float(rec['xyxy'][1]))
+            out.append(float(h or 0.0))
+        if max(out, default=0) > 0:
+            return out
+    return None
+
+
+def _heights_from_list_field(tr: dict, n: int) -> list[float] | None:
+    if n <= 0:
+        return None
+    for key in _HEIGHT_KEYS:
+        raw = tr.get(key)
+        if not isinstance(raw, list) or not raw:
+            continue
+        out = []
+        for v in raw[:n]:
+            try:
+                out.append(float(v) if v not in (None, '') else 0.0)
+            except (TypeError, ValueError):
+                out.append(0.0)
+        out.extend([0.0] * max(0, n - len(out)))
+        if max(out, default=0) > 0:
+            return out[:n]
+    wh = tr.get('wh')
+    if isinstance(wh, list) and len(wh) >= n:
+        out = []
+        for row in wh[:n]:
+            if row and len(row) >= 2:
+                out.append(float(row[1]))
+            else:
+                out.append(0.0)
+        if max(out, default=0) > 0:
+            return out
+    return None
+
+
+def _measured_heights(
+        tr: dict, n: int, frame_h: float, dump: dict) -> list[float] | None:
+    candidates: list[list[float]] = []
+    for fn in (_heights_from_list_field, _heights_from_xyxy,
+               _heights_from_record_list):
+        hs = fn(tr, n)
+        if hs is None:
+            continue
+        hs = _scale_heights_infer_to_video(hs, frame_h, dump)
+        if max(hs, default=0) > 0:
+            candidates.append(hs)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda h: max(h))
+
+
+def referee_class_from_dump(dump: dict) -> int | None:
+    if dump.get('referee_class_id') is not None:
+        return int(dump['referee_class_id'])
+    for key in ('class_ids', 'class_map', 'detector_classes', 'class_names'):
+        raw = dump.get(key)
+        if not isinstance(raw, dict) or not raw:
+            continue
+        # Name -> id, e.g. {"referee": 3, "player": 2}
+        by_name = {str(k).strip().lower(): v for k, v in raw.items()}
+        if 'referee' in by_name:
+            return int(by_name['referee'])
+        # Id -> name, e.g. {"0": "ball", "3": "referee"}
+        for k, v in raw.items():
+            if str(v).strip().lower() == 'referee':
+                return int(k)
+    return None
+
+
+def resolve_referee_class_id(dump: dict, cli_override: int | None) -> int:
+    """CLI override wins; else dump class map; else RF-DETR default (3)."""
+    if cli_override is not None:
+        return int(cli_override)
+    from_dump = referee_class_from_dump(dump)
+    if from_dump is not None:
+        return from_dump
+    return FALLBACK_REFEREE_CLASS_ID
+
+
+def sample_centre_and_height(
+        tr: dict, idx: int, hs: list[float]) -> tuple[float, float, float]:
+    xy = tr['xy'][idx]
+    h = float(hs[idx]) if idx < len(hs) else 0.0
+    if len(xy) >= 4:
+        p = [float(v) for v in xy[:4]]
+        if _looks_like_cxcywh(p):
+            cx, cy, bh = p[0], p[1], p[3]
+            return cx, cy, bh if bh > 0 else h
+        x1, y1, x2, y2 = p
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        bh = abs(y2 - y1)
+        return cx, cy, bh if bh > 0 else h
+    return float(xy[0]), float(xy[1]), h
+
+
+def fit_y_height_model(tracks: list[dict], frame_h: float, dump: dict):
+    """Linear y -> box height from tracks that already have pixel heights."""
+    ys, hs = [], []
+    for tr in tracks:
+        n = len(tr.get('frames') or [])
+        if n < 2:
+            continue
+        hlist = _measured_heights(tr, n, frame_h, dump)
+        if hlist is None:
+            continue
+        xy = tr.get('xy') or []
+        for i in range(min(n, len(xy), len(hlist))):
+            hf = float(hlist[i])
+            if hf <= 0:
+                continue
+            pt = xy[i]
+            if pt and len(pt) >= 2:
+                ys.append(float(pt[1]))
+                hs.append(hf)
+    if len(ys) < 20:
+        return None
+    a, b = np.polyfit(np.asarray(ys, float), np.asarray(hs, float), 1)
+    return lambda y: max(8.0, float(a * y + b))
+
+
+def per_track_heights(
+        tr: dict, frame_h: float, y_model, dump: dict) -> list[float]:
+    n = len(tr.get('frames') or [])
+    if n == 0:
+        return []
+    hs = _measured_heights(tr, n, frame_h, dump)
+    if hs is not None:
+        return hs
+    xy = tr.get('xy') or []
+    if y_model is not None and len(xy) >= n:
+        return [float(y_model(float(xy[i][1]))) for i in range(n)]
+    return [0.0] * n
+
+
+def iter_dump_tracks(dump: dict) -> list[dict]:
+    for key in ('tracks', 'tracklets', 'fragments'):
+        arr = dump.get(key)
+        if isinstance(arr, list) and arr:
+            return arr
+    return []
+
+
+def dump_height_diagnostics(dump: dict, tracks: list[dict], frame_h: float) -> dict:
+    y_model = fit_y_height_model(tracks, frame_h, dump)
+    max_h = 0.0
+    n_with = 0
+    for tr in tracks:
+        hs = per_track_heights(tr, frame_h, y_model, dump)
+        if hs and max(hs) > 0:
+            n_with += 1
+            max_h = max(max_h, max(hs))
+    sample = tracks[0] if tracks else {}
+    return {
+        'n_tracks': len(tracks),
+        'tracks_with_height': n_with,
+        'global_max_height_px': round(max_h, 1),
+        'sample_track_keys': sorted(sample.keys()) if sample else [],
+        'used_y_fallback_model': y_model is not None,
+        'dump_width': dump.get('width'),
+        'dump_height': dump.get('height'),
+    }
+
+
 def eligible_fragments(
     dump: dict,
     min_h: float,
     min_large_frames: int,
     max_samples: int,
     skip_referees: bool,
-) -> list[dict]:
+    referee_class: int | None = None,
+) -> tuple[list[dict], dict]:
+    frame_h = float(dump.get('height') or 0)
+    tracks = iter_dump_tracks(dump)
+    ref_cls = resolve_referee_class_id(dump, referee_class)
+    y_model = fit_y_height_model(tracks, frame_h, dump)
     eligible = []
-    for tr in dump.get('tracks', []):
-        if skip_referees and int(tr.get('class', 1)) == REFEREE_CLASS_ID:
-            continue
+    n_referee_tracks_skipped = 0
+    n_referee_skipped_height_eligible = 0
+    for tr in tracks:
         frames = tr['frames']
-        hs = tr['h']
+        hs = per_track_heights(tr, frame_h, y_model, dump)
+        if len(hs) != len(frames):
+            hs = (hs + [0.0] * len(frames))[:len(frames)]
         large_idx = [i for i, h in enumerate(hs) if float(h) >= min_h]
-        if len(large_idx) < min_large_frames:
+        height_ok = len(large_idx) >= min_large_frames
+        if skip_referees and int(tr.get('class', 1)) == ref_cls:
+            n_referee_tracks_skipped += 1
+            if height_ok:
+                n_referee_skipped_height_eligible += 1
+            continue
+        if not height_ok:
             continue
         sample_idx = _spread_indices(large_idx, max_samples)
         eligible.append({
@@ -158,8 +440,23 @@ def eligible_fragments(
             'n_large': len(large_idx),
             'sample_idx': sample_idx,
             'frames': frames,
+            'heights': hs,
         })
-    return eligible
+    diag = dump_height_diagnostics(dump, tracks, frame_h)
+    diag['referee_class_id'] = ref_cls
+    diag['referee_tracks_skipped'] = n_referee_tracks_skipped
+    diag['referee_skipped_height_eligible'] = n_referee_skipped_height_eligible
+    return eligible, diag
+
+
+def json_safe(obj):
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return obj
 
 
 def frames_to_decode(eligible: list[dict]) -> set[int]:
@@ -275,13 +572,19 @@ def main() -> None:
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--max-fragments', type=int, default=0,
                     help='Cap probed fragments (0 = all eligible)')
+    ap.add_argument('--referee-class', type=int, default=None,
+                    help='Referee class id to skip (default: dump class map, '
+                         'else 3 for RF-DETR). YOLO panoramic finetune uses 2.')
+    ap.add_argument('--include-referees', action='store_true',
+                    help='Do not skip referee-class fragments')
     args = ap.parse_args()
 
     dump = json.loads(args.dump.read_text(encoding='utf-8'))
     start_frame = int(dump.get('start_frame') or 0)
-    eligible = eligible_fragments(
+    eligible, height_diag = eligible_fragments(
         dump, args.min_h, args.min_large_frames, args.max_samples,
-        skip_referees=True)
+        skip_referees=not args.include_referees,
+        referee_class=args.referee_class)
 
     if args.max_fragments and len(eligible) > args.max_fragments:
         rng = random.Random(args.seed)
@@ -289,15 +592,28 @@ def main() -> None:
 
     needed_frames = frames_to_decode(eligible)
     print(f'Dump: {args.dump.name}')
+    ref_skip = height_diag.get('referee_tracks_skipped', 0)
+    ref_skip_ok = height_diag.get('referee_skipped_height_eligible', 0)
+    ref_cls = height_diag.get('referee_class_id')
     print(f'Eligible fragments (>={args.min_large_frames} frames h>={args.min_h}): '
           f'{len(eligible)}')
+    if not args.include_referees:
+        print(f'  Referee filter: class_id={ref_cls} — skipped {ref_skip} track(s)'
+              f' ({ref_skip_ok} would have met height threshold)')
+    print(f'  Height diagnostics: {height_diag}')
+    if not eligible and ref_skip_ok and not args.include_referees:
+        print('  WARNING: referee filter removed all height-eligible tracks — '
+              f'check --referee-class (YOLO panoramic finetune: 2, RF-DETR: 3).')
+    elif not eligible:
+        print('  WARNING: 0 eligible — check dump has h/box_height_px/xyxy or '
+              'centre-y with measured heights on other tracks.')
     print(f'Unique frames to decode: {len(needed_frames)}')
     print(f'Sequential read from dump start_frame={start_frame} (no seek)...')
 
     frame_cache = read_video_frames_sequential(
         args.video, start_frame, needed_frames)
 
-    track_by_id = {int(tr['id']): tr for tr in dump['tracks']}
+    track_by_id = {int(tr['id']): tr for tr in iter_dump_tracks(dump)}
     ocr = OcrEngine(gpu=not args.cpu)
     results = []
 
@@ -306,7 +622,7 @@ def main() -> None:
         tr = track_by_id[tid]
         frames = meta['frames']
         xy = tr['xy']
-        hs = tr['h']
+        hs = meta['heights']
         all_reads: list[tuple[int, float]] = []
         per_sample = []
         best_crop = None
@@ -317,8 +633,7 @@ def main() -> None:
             frame = frame_cache.get(fnum)
             if frame is None:
                 continue
-            cx, cy = float(xy[si][0]), float(xy[si][1])
-            h = float(hs[si])
+            cx, cy, h = sample_centre_and_height(tr, si, hs)
             x1, y1, x2, y2 = box_from_centre_h(cx, cy, h, args.width_frac)
             crop = torso_crop(frame, x1, y1, x2, y2)
             up = upscale(crop, args.upscale)
@@ -394,7 +709,8 @@ def main() -> None:
     payload = {
         'dump': str(args.dump),
         'video': str(args.video),
-        'params': {k: v for k, v in vars(args).items()},
+        'params': json_safe(vars(args)),
+        'height_diagnostics': height_diag,
         'summary': {
             'fragments_probed': n_probed,
             'any_read': n_any,
@@ -406,7 +722,8 @@ def main() -> None:
         'team_number_distribution': {k: dict(v) for k, v in by_team.items()},
         'fragments': serializable,
     }
-    report_path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    report_path.write_text(
+        json.dumps(json_safe(payload), indent=2), encoding='utf-8')
     print(f'\n  Report: {report_path}')
 
     rng = random.Random(args.seed)
