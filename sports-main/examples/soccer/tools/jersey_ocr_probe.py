@@ -16,6 +16,10 @@ variable-frame-rate sources.
 Pass: >=30%% of probed fragments get a consistent number (3+ agreeing reads,
 majority >=60%% of successful reads) and the contact sheet looks like real
 jersey digits. Below 10%% -> stop.
+
+Quick runs (avoid decoding the full clip for all eligible fragments):
+  python tools/jersey_ocr_probe.py --dump ... --video ... --feasibility
+  python tools/jersey_ocr_probe.py --dump ... --eligible-only   # no video/OCR
 """
 from __future__ import annotations
 
@@ -488,6 +492,7 @@ def read_video_frames_sequential(
                 return out
             frame_idx += 1
 
+        log_every = max(500, (max_f - start_frame) // 20)
         while frame_idx <= max_f:
             ok, frame = cap.read()
             if not ok:
@@ -496,6 +501,9 @@ def read_video_frames_sequential(
                 out[frame_idx] = frame
                 if len(out) == len(needed):
                     break
+            if log_every and frame_idx % log_every == 0:
+                print(f'  decode: frame {frame_idx}/{max_f}, '
+                      f'have {len(out)}/{len(needed)} targets', flush=True)
             frame_idx += 1
     finally:
         cap.release()
@@ -557,7 +565,12 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dump', type=Path, required=True,
                     help='track_dump_*deliver_v2*.json')
-    ap.add_argument('--video', type=Path, required=True)
+    ap.add_argument('--video', type=Path, default=None,
+                    help='Source video (not needed with --eligible-only)')
+    ap.add_argument('--eligible-only', action='store_true',
+                    help='Eligibility + height stats from dump only (seconds)')
+    ap.add_argument('--feasibility', action='store_true',
+                    help='Cap at 40 fragments / contact sheet 40 (default quick run)')
     ap.add_argument('--out-dir', type=Path, default=Path('data/jersey_ocr_probe'))
     ap.add_argument('--min-h', type=float, default=200.0)
     ap.add_argument('--min-large-frames', type=int, default=20)
@@ -579,6 +592,12 @@ def main() -> None:
                     help='Do not skip referee-class fragments')
     args = ap.parse_args()
 
+    if args.feasibility:
+        if not args.max_fragments:
+            args.max_fragments = 40
+        if args.contact_n == 40:
+            args.contact_n = 40
+
     dump = json.loads(args.dump.read_text(encoding='utf-8'))
     start_frame = int(dump.get('start_frame') or 0)
     eligible, height_diag = eligible_fragments(
@@ -586,6 +605,7 @@ def main() -> None:
         skip_referees=not args.include_referees,
         referee_class=args.referee_class)
 
+    n_eligible_total = len(eligible)
     if args.max_fragments and len(eligible) > args.max_fragments:
         rng = random.Random(args.seed)
         eligible = rng.sample(eligible, args.max_fragments)
@@ -595,8 +615,12 @@ def main() -> None:
     ref_skip = height_diag.get('referee_tracks_skipped', 0)
     ref_skip_ok = height_diag.get('referee_skipped_height_eligible', 0)
     ref_cls = height_diag.get('referee_class_id')
-    print(f'Eligible fragments (>={args.min_large_frames} frames h>={args.min_h}): '
-          f'{len(eligible)}')
+    if n_eligible_total != len(eligible):
+        print(f'Eligible fragments (>={args.min_large_frames} frames h>={args.min_h}): '
+              f'{n_eligible_total} total, probing {len(eligible)}')
+    else:
+        print(f'Eligible fragments (>={args.min_large_frames} frames h>={args.min_h}): '
+              f'{n_eligible_total}')
     if not args.include_referees:
         print(f'  Referee filter: class_id={ref_cls} — skipped {ref_skip} track(s)'
               f' ({ref_skip_ok} would have met height threshold)')
@@ -608,6 +632,24 @@ def main() -> None:
         print('  WARNING: 0 eligible — check dump has h/box_height_px/xyxy or '
               'centre-y with measured heights on other tracks.')
     print(f'Unique frames to decode: {len(needed_frames)}')
+
+    if args.eligible_only:
+        out = args.out_dir / 'jersey_ocr_eligible_summary.json'
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        summary = {
+            'dump': str(args.dump),
+            'eligible_total': n_eligible_total,
+            'min_h': args.min_h,
+            'min_large_frames': args.min_large_frames,
+            'height_diagnostics': height_diag,
+        }
+        out.write_text(json.dumps(json_safe(summary), indent=2), encoding='utf-8')
+        print(f'Wrote {out} (--eligible-only, no video/OCR)')
+        return
+
+    if args.video is None:
+        raise SystemExit('--video is required unless --eligible-only')
+
     print(f'Sequential read from dump start_frame={start_frame} (no seek)...')
 
     frame_cache = read_video_frames_sequential(
@@ -617,7 +659,9 @@ def main() -> None:
     ocr = OcrEngine(gpu=not args.cpu)
     results = []
 
-    for meta in eligible:
+    for fi, meta in enumerate(eligible):
+        if (fi + 1) % 5 == 0 or fi == 0:
+            print(f'  OCR fragment {fi + 1}/{len(eligible)}...', flush=True)
         tid = meta['id']
         tr = track_by_id[tid]
         frames = meta['frames']
