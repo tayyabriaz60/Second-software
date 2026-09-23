@@ -5,7 +5,8 @@ Uses a track_dump JSON only — does not modify main.py or assign_identities.py.
 
 Usage (RunPod, from sports-main/examples/soccer):
   pip install easyocr opencv-python-headless
-  # Debug Paddle compare: pip install paddlepaddle-gpu paddleocr  (or paddlepaddle on CPU)
+  # Paddle compare (frag 178): pip install paddlepaddle-gpu==2.6.2 paddleocr==2.7.3
+  # If 3.x paddlex crashes on set_optimization_level, use PADDLEOCR_LEGACY=1 or pins above.
   python tools/jersey_ocr_probe.py \\
     --dump data/id_lists/track_dump_clip10min_deliver_v2.json \\
     --video /workspace/clip10min.mp4 \\
@@ -376,42 +377,112 @@ def _parse_paddle_v3_result(result) -> list[tuple[list, str, float]]:
     return out
 
 
+def _paddle_install_hint() -> str:
+    return (
+        'PaddleOCR init failed (often paddlepaddle vs paddlex mismatch). On the pod try:\n'
+        '  pip uninstall -y paddleocr paddlex paddlepaddle paddlepaddle-gpu\n'
+        '  pip install paddlepaddle-gpu==2.6.2 paddleocr==2.7.3\n'
+        'Or upgrade paddle to match paddlex: pip install -U paddlepaddle-gpu\n'
+        'Then re-run with env PADDLEOCR_LEGACY=1 to skip PaddleOCR 3.x pipeline.'
+    )
+
+
 class PaddleOcrEngine:
     def __init__(self, gpu: bool):
         self._ocr = None
         self._gpu = gpu
         self._api: str = 'v3'
+        self._mode_label: str = ''
 
     def _lazy_init(self):
         if self._ocr is not None:
             return
+        import os
         from paddleocr import PaddleOCR
+
         device = 'gpu' if self._gpu else 'cpu'
-        try:
-            self._ocr = PaddleOCR(
+        errors: list[str] = []
+        force_legacy = os.environ.get('PADDLEOCR_LEGACY', '').lower() in (
+            '1', 'true', 'yes')
+
+        def _try_v3():
+            return PaddleOCR(
                 lang='en',
                 device=device,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
             )
-            self._api = 'v3'
-        except (TypeError, ValueError) as exc:
-            # PaddleOCR 2.x
-            if 'device' in str(exc) or 'use_textline' in str(exc):
-                self._ocr = PaddleOCR(
-                    use_angle_cls=False,
-                    lang='en',
-                    use_gpu=self._gpu,
-                )
-                self._api = 'legacy'
-            else:
-                raise
+
+        def _try_legacy():
+            return PaddleOCR(
+                use_angle_cls=False,
+                lang='en',
+                use_gpu=self._gpu,
+            )
+
+        def _try_rec_only():
+            from paddleocr import TextRecognition
+            try:
+                return TextRecognition(device=device)
+            except TypeError:
+                return TextRecognition()
+
+        if not force_legacy:
+            try:
+                self._ocr = _try_v3()
+                self._api = 'v3'
+                self._mode_label = 'PaddleOCR 3.x pipeline'
+                print(f'PaddleOCR: {self._mode_label}')
+                return
+            except Exception as exc:
+                errors.append(f'3.x pipeline: {exc!r}')
+
+        try:
+            self._ocr = _try_legacy()
+            self._api = 'legacy'
+            self._mode_label = 'PaddleOCR 2.x (det+rec)'
+            print(f'PaddleOCR: {self._mode_label}')
+            return
+        except Exception as exc:
+            errors.append(f'2.x det+rec: {exc!r}')
+
+        try:
+            self._ocr = _try_rec_only()
+            self._api = 'rec_only'
+            self._mode_label = 'PaddleOCR TextRecognition (rec only, no det)'
+            print(f'PaddleOCR: {self._mode_label}')
+            return
+        except Exception as exc:
+            errors.append(f'TextRecognition: {exc!r}')
+
+        raise RuntimeError(
+            _paddle_install_hint() + '\n' + '\n'.join(errors))
 
     def readtext_raw(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
         if bgr.size == 0:
             return []
         self._lazy_init()
+        fh, fw = bgr.shape[:2]
+        full_box = [[0, 0], [fw, 0], [fw, fh], [0, fh]]
+
+        if self._api == 'rec_only':
+            predict = self._ocr.predict
+            try:
+                result = predict(bgr)
+            except TypeError:
+                result = predict(input=bgr)
+            parsed = _parse_paddle_v3_result(result)
+            if not parsed and isinstance(result, list):
+                for item in result:
+                    if hasattr(item, 'rec_text'):
+                        parsed.append((
+                            full_box, str(item.rec_text),
+                            float(getattr(item, 'rec_score', 1.0))))
+            if parsed:
+                return parsed
+            return []
+
         if self._api == 'v3':
             predict = self._ocr.predict
             try:
