@@ -332,26 +332,105 @@ def serialize_det_boxes(
     return out
 
 
+def _parse_paddle_v3_result(result) -> list[tuple[list, str, float]]:
+    """PaddleOCR 3.x predict() -> [(box, text, conf), ...]."""
+    out: list[tuple[list, str, float]] = []
+
+    def _consume_page(page) -> None:
+        if page is None:
+            return
+        data = page
+        if hasattr(page, 'json'):
+            j = page.json
+            data = j() if callable(j) else j
+        elif hasattr(page, 'res'):
+            data = page.res
+        if isinstance(data, dict) and 'res' in data:
+            data = data['res']
+        if not isinstance(data, dict):
+            return
+        texts = data.get('rec_texts') or data.get('texts') or []
+        scores = data.get('rec_scores') or data.get('scores') or []
+        boxes = data.get('rec_boxes') or data.get('dt_polys') or data.get('boxes')
+        if texts and boxes is not None:
+            for i, text in enumerate(texts):
+                if not text or not str(text).strip():
+                    continue
+                conf = float(scores[i]) if i < len(scores) else 1.0
+                box = boxes[i]
+                if hasattr(box, 'tolist'):
+                    box = box.tolist()
+                out.append((box, str(text), conf))
+            return
+        # Single-line recognition-only payload
+        if data.get('rec_text'):
+            out.append(([[0, 0], [1, 0], [1, 1], [0, 1]],
+                        str(data['rec_text']),
+                        float(data.get('rec_score') or 1.0)))
+
+    if isinstance(result, list):
+        for page in result:
+            _consume_page(page)
+    else:
+        _consume_page(result)
+    return out
+
+
 class PaddleOcrEngine:
     def __init__(self, gpu: bool):
         self._ocr = None
         self._gpu = gpu
+        self._api: str = 'v3'
 
     def _lazy_init(self):
         if self._ocr is not None:
             return
         from paddleocr import PaddleOCR
-        self._ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang='en',
-            use_gpu=self._gpu,
-            show_log=False,
-        )
+        device = 'gpu' if self._gpu else 'cpu'
+        try:
+            self._ocr = PaddleOCR(
+                lang='en',
+                device=device,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+            self._api = 'v3'
+        except (TypeError, ValueError) as exc:
+            # PaddleOCR 2.x
+            if 'device' in str(exc) or 'use_textline' in str(exc):
+                self._ocr = PaddleOCR(
+                    use_angle_cls=False,
+                    lang='en',
+                    use_gpu=self._gpu,
+                )
+                self._api = 'legacy'
+            else:
+                raise
 
     def readtext_raw(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
         if bgr.size == 0:
             return []
         self._lazy_init()
+        if self._api == 'v3':
+            predict = self._ocr.predict
+            try:
+                result = predict(bgr)
+            except TypeError:
+                result = predict(input=bgr)
+            parsed = _parse_paddle_v3_result(result)
+            if parsed:
+                return parsed
+            # Some builds still expose ocr() with 2.x-shaped output
+            if hasattr(self._ocr, 'ocr'):
+                pages = self._ocr.ocr(bgr, cls=False)
+                if pages:
+                    for page in pages:
+                        if not page:
+                            continue
+                        for box, (text, conf) in page:
+                            parsed.append((box, text, float(conf)))
+            return parsed
         pages = self._ocr.ocr(bgr, cls=False)
         if not pages:
             return []
@@ -411,7 +490,7 @@ def export_fragment_crops(
         up = upscale(crop, args.upscale)
         tag = f'frag{fragment_id}_f{fnum}'
         cv2.imwrite(str(crops_dir / f'{tag}_up.jpg'), up)
-        if not args.no_ocr_preprocess:
+        if args.ocr_preprocess:
             cv2.imwrite(str(crops_dir / f'{tag}_pre.jpg'), preprocess_for_ocr(up))
         n += 1
     print(f'Wrote {n} crop(s) to {crops_dir}/')
@@ -436,7 +515,7 @@ def run_fragment_ocr_debug(
     print(f'  crop: centre (cx,cy)+h — y=[cy-{TORSO_Y_ABOVE}h, cy+{TORSO_Y_BELOW}h], '
           f'x=±{TORSO_X_HALF}h (dump xy is box centre, not feet)')
     print(f'  torso_width_margin={args.torso_width_margin} upscale={args.upscale}')
-    print(f'  ocr_preprocess={not args.no_ocr_preprocess}')
+    print(f'  ocr_preprocess={args.ocr_preprocess} (debug w/ Paddle always logs raw+pre)')
     crops_dir = out_dir / f'crops_frag{fragment_id}'
     crops_dir.mkdir(parents=True, exist_ok=True)
     print(f'  Saving upscaled crops -> {crops_dir}/')
@@ -450,7 +529,8 @@ def run_fragment_ocr_debug(
         crop, (x1, y1, x2, y2) = centre_torso_crop(
             frame, cx, cy, h, width_margin=args.torso_width_margin)
         up = upscale(crop, args.upscale)
-        up_pp = preprocess_for_ocr(up) if not args.no_ocr_preprocess else up
+        debug_dual = paddle is not None
+        up_pp = preprocess_for_ocr(up) if (args.ocr_preprocess or debug_dual) else up
         crop_info = {
             'frame': fnum,
             'centre_xy': [round(cx, 1), round(cy, 1)],
@@ -462,7 +542,7 @@ def run_fragment_ocr_debug(
         }
         tag = f'frag{fragment_id}_f{fnum}'
         cv2.imwrite(str(crops_dir / f'{tag}_up.jpg'), up)
-        if not args.no_ocr_preprocess:
+        if args.ocr_preprocess or debug_dual:
             cv2.imwrite(str(crops_dir / f'{tag}_pre.jpg'), up_pp)
 
         def _easy_report(label: str, img: np.ndarray) -> dict:
@@ -488,10 +568,7 @@ def run_fragment_ocr_debug(
             }
 
         easy_raw = _easy_report('raw upscale', up)
-        easy_pp = (
-            _easy_report('preprocessed', up_pp)
-            if not args.no_ocr_preprocess else None
-        )
+        easy_pp = _easy_report('preprocessed', up_pp) if debug_dual else None
 
         paddle_raw = paddle_pp = None
         if paddle is not None:
@@ -499,7 +576,7 @@ def run_fragment_ocr_debug(
                 ('raw', up),
                 ('preprocessed', up_pp),
             ):
-                if label == 'preprocessed' and args.no_ocr_preprocess:
+                if label == 'preprocessed' and not debug_dual:
                     continue
                 praw = paddle.readtext_raw(img)
                 preads = paddle.read_digits(img)
@@ -524,7 +601,7 @@ def run_fragment_ocr_debug(
                 'upscaled': str(crops_dir / f'{tag}_up.jpg'),
                 'preprocessed': (
                     str(crops_dir / f'{tag}_pre.jpg')
-                    if not args.no_ocr_preprocess else None
+                    if (args.ocr_preprocess or debug_dual) else None
                 ),
             },
             'easyocr_raw': easy_raw,
@@ -552,7 +629,7 @@ def run_fragment_ocr_debug(
     if paddle is not None:
         cmp = print_engine_compare_table(
             fragment_id, samples_out,
-            use_preprocessed=not args.no_ocr_preprocess)
+            include_preprocessed=debug_dual)
         cmp_path = out_dir / f'engine_compare_frag{fragment_id}.json'
         cmp_path.write_text(json.dumps(json_safe(cmp), indent=2), encoding='utf-8')
         print(f'  Wrote {cmp_path}')
@@ -1032,50 +1109,84 @@ def _reads_summary(reads: list[tuple[int, float, str]]) -> str:
     return ','.join(f'{n}({c:.2f})' for n, c, _ in reads[:3])
 
 
-def print_engine_compare_table(
+def _engine_compare_one(
         fragment_id: int,
         samples: list[dict],
         *,
         use_preprocessed: bool,
 ) -> dict:
-    """Side-by-side EasyOCR vs Paddle on corrected crops."""
     key_easy = 'easyocr_preprocessed' if use_preprocessed else 'easyocr_raw'
     key_pad = 'paddle_preprocessed' if use_preprocessed else 'paddle_raw'
-    print(f'\n=== Engine compare fragment {fragment_id} '
-          f'({"preprocessed" if use_preprocessed else "raw"} crop) ===')
+    label = 'preprocessed (CLAHE+sharpen)' if use_preprocessed else 'raw upscale'
+    print(f'\n=== Engine compare fragment {fragment_id} — {label} ===')
     print(f'{"frame":>8}  {"easy":>6}  {"paddle":>6}  easy reads          paddle reads')
     rows = []
     n_paddle_10 = n_easy_10 = 0
-    n_both = 0
+    n_paddle_any = 0
     for s in samples:
         fnum = s['frame']
         eb = s.get(key_easy) or {}
         pb = s.get(key_pad)
         easy_r = eb.get('read_digits') or []
-        pad_r = (pb or {}).get('read_digits') or []
+        pad_r = (pb or {}).get('read_digits') or [] if pb else []
         en = easy_r[0]['number'] if easy_r else None
         pn = pad_r[0]['number'] if pad_r else None
         if pn is not None:
-            n_both += 1
+            n_paddle_any += 1
         if en == 10:
             n_easy_10 += 1
         if pn == 10:
             n_paddle_10 += 1
         es = en if en is not None else '—'
         ps = pn if pn is not None else '—'
-        print(f'{fnum:8d}  {es!s:>6}  {ps!s:>6}  {_reads_summary([(r["number"], r["confidence"], r.get("raw_digits","")) for r in easy_r])!s:18}  {_reads_summary([(r["number"], r["confidence"], r.get("raw_digits","")) for r in pad_r]) if pad_r else "—"}')
+        er = [(r['number'], r['confidence'], r.get('raw_digits', '')) for r in easy_r]
+        pr = [(r['number'], r['confidence'], r.get('raw_digits', '')) for r in pad_r]
+        print(f'{fnum:8d}  {es!s:>6}  {ps!s:>6}  {_reads_summary(er)!s:18}  '
+              f'{_reads_summary(pr) if pad_r else "—"}')
         rows.append({'frame': fnum, 'easy': en, 'paddle': pn})
-    print(f'\n  Frames with paddle read: {n_both}/{len(samples)}')
+    print(f'  Frames with paddle read: {n_paddle_any}/{len(samples)}')
     print(f'  EasyOCR read 10 on {n_easy_10} frame(s); Paddle read 10 on {n_paddle_10} frame(s)')
+    return {
+        'crop_variant': label,
+        'fragment_id': fragment_id,
+        'rows': rows,
+        'easy_frames_with_10': n_easy_10,
+        'paddle_frames_with_10': n_paddle_10,
+        'paddle_frames_with_any_read': n_paddle_any,
+    }
+
+
+def _verdict_from_compare(cmp: dict) -> str:
+    n_easy_10 = cmp['easy_frames_with_10']
+    n_paddle_10 = cmp['paddle_frames_with_10']
     if n_paddle_10 > n_easy_10:
-        print('  Verdict: Paddle reads 10 more often — try --ocr-engine paddle and re-run probe.')
-    elif n_paddle_10 == 0 and n_easy_10 == 0:
-        print('  Verdict: Neither engine read 10 — off-the-shelf OCR likely insufficient; '
-              'train a digit model on these crops.')
-    else:
-        print('  Verdict: Paddle did not beat EasyOCR on digit 10 — same resolution limit.')
-    return {'fragment_id': fragment_id, 'rows': rows,
-            'easy_frames_with_10': n_easy_10, 'paddle_frames_with_10': n_paddle_10}
+        return ('Paddle reads 10 more often — try --ocr-engine paddle and re-run probe.')
+    if n_paddle_10 == 0 and n_easy_10 == 0:
+        return ('Neither engine read 10 — off-the-shelf OCR likely insufficient; '
+                'train a digit model on these crops.')
+    return 'Paddle did not beat EasyOCR on digit 10 — same resolution limit.'
+
+
+def print_engine_compare_table(
+        fragment_id: int,
+        samples: list[dict],
+        *,
+        include_preprocessed: bool,
+) -> dict:
+    """Side-by-side EasyOCR vs Paddle; always raw upscale, optional preprocess pass."""
+    raw_cmp = _engine_compare_one(fragment_id, samples, use_preprocessed=False)
+    pre_cmp = None
+    if include_preprocessed:
+        pre_cmp = _engine_compare_one(fragment_id, samples, use_preprocessed=True)
+    print(f'\n  Primary verdict (raw upscale): {_verdict_from_compare(raw_cmp)}')
+    if pre_cmp is not None:
+        print(f'  Preprocessed pass verdict: {_verdict_from_compare(pre_cmp)}')
+    return {
+        'fragment_id': fragment_id,
+        'raw_upscale': raw_cmp,
+        'preprocessed': pre_cmp,
+        'primary_verdict': _verdict_from_compare(raw_cmp),
+    }
 
 
 def make_probe_ocr(args) -> OcrEngine | PaddleOcrEngine:
@@ -1125,7 +1236,7 @@ def thumbs_from_report(
                 frame, cx, cy, h, width_margin=args.torso_width_margin)
             up = upscale(crop, args.upscale)
             img = (
-                preprocess_for_ocr(up) if not args.no_ocr_preprocess else up)
+                preprocess_for_ocr(up) if args.ocr_preprocess else up)
             reads = ps.get('reads') or []
             conf = max((float(r.get('confidence', 0)) for r in reads), default=0.0)
             if conf > best_conf or best_crop is None:
@@ -1209,8 +1320,8 @@ def main() -> None:
                     help='With --debug-fragment: write upscaled crop JPGs only (no OCR)')
     ap.add_argument('--no-ocr-paragraph', action='store_true',
                     help='EasyOCR paragraph=False only (skip paragraph=True pass)')
-    ap.add_argument('--no-ocr-preprocess', action='store_true',
-                    help='Skip CLAHE + sharpen before OCR (debug compares raw vs pre)')
+    ap.add_argument('--ocr-preprocess', action='store_true',
+                    help='CLAHE + sharpen before OCR on probe runs (default: raw upscale only)')
     ap.add_argument('--no-paddle-debug', action='store_true',
                     help='With --debug-fragment, skip PaddleOCR comparison')
     ap.add_argument('--compare-engines', action='store_true',
@@ -1407,7 +1518,7 @@ def main() -> None:
                 frame, cx, cy, h, width_margin=args.torso_width_margin)
             up = upscale(crop, args.upscale)
             ocr_in = (
-                preprocess_for_ocr(up) if not args.no_ocr_preprocess else up)
+                preprocess_for_ocr(up) if args.ocr_preprocess else up)
             reads = ocr.read_digits(ocr_in)
             for num, conf, _raw in reads:
                 all_reads.append((num, conf))
