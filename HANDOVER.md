@@ -495,7 +495,41 @@ JPGs land in `out-dir/crops_frag178/` (`*_up.jpg`, optional `*_pre.jpg`). If
 the shirt is not in the crop, stop — nothing downstream matters.
 
 Debug with EasyOCR + optional PaddleOCR compare: `--debug-fragment 178
---debug-only` (see tool help for `--no-paddle-debug`, `--no-ocr-preprocess`).
+--compare-engines --debug-only` (primary verdict is **raw upscale**, not CLAHE).
+
+### RunPod: fix cv2/numpy after a bad Paddle pip install
+
+Installing Paddle in the **same** env as the tracking stack often breaks OpenCV:
+pip may remove `opencv-contrib-python` and leave **NumPy 2.x** while **cv2** was
+built for NumPy 1.x (`numpy.core.multiarray failed to import`). The `blinker`
+uninstall error is a red herring — ignore it; repair numpy/opencv first.
+
+**Restore the main env (EasyOCR probe + main.py):**
+
+```bash
+pip install --force-reinstall "numpy==1.26.4" \
+  "opencv-contrib-python==4.10.0.84" "opencv-python-headless==4.10.0.84"
+python -c "import cv2, numpy; print('ok', numpy.__version__, cv2.__version__)"
+```
+
+**Paddle compare only — use a separate venv** (do not pip install Paddle into
+the tracking env again):
+
+```bash
+python3.11 -m venv /workspace/venv_jersey_paddle
+source /workspace/venv_jersey_paddle/bin/activate
+pip install "numpy==1.26.4" opencv-python-headless==4.10.0.84 easyocr
+pip install paddlepaddle-gpu==2.6.2 paddleocr==2.7.3
+cd /workspace/Second-software/sports-main/examples/soccer
+export PYTHONPATH=/workspace/Second-software/sports-main
+export PADDLEOCR_LEGACY=1
+python tools/jersey_ocr_probe.py \
+  --dump data/id_lists/track_dump_clip10min_deliver_v2.json \
+  --video /workspace/clip10min.mp4 \
+  --out-dir data/jersey_ocr_engine178 \
+  --only-fragments 178 --debug-fragment 178 \
+  --compare-engines --debug-only
+```
 
 ### When v4 finishes — three checks
 

@@ -5,8 +5,9 @@ Uses a track_dump JSON only — does not modify main.py or assign_identities.py.
 
 Usage (RunPod, from sports-main/examples/soccer):
   pip install easyocr opencv-python-headless
-  # Paddle compare (frag 178): pip install paddlepaddle-gpu==2.6.2 paddleocr==2.7.3
-  # If 3.x paddlex crashes on set_optimization_level, use PADDLEOCR_LEGACY=1 or pins above.
+  # Paddle: use a SEPARATE venv (see HANDOVER.md) — do not pip paddle into the
+  # tracking env; it breaks cv2/numpy. Pins: paddlepaddle-gpu==2.6.2 paddleocr==2.7.3
+  # PADDLEOCR_LEGACY=1 if 3.x paddlex fails on set_optimization_level.
   python tools/jersey_ocr_probe.py \\
     --dump data/id_lists/track_dump_clip10min_deliver_v2.json \\
     --video /workspace/clip10min.mp4 \\
