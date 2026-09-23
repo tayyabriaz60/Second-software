@@ -125,12 +125,76 @@ def parse_jersey_number(text: str) -> int | None:
     return None
 
 
+# EasyOCR often reads jersey digits as letters (e.g. 0 -> "ll", 1 -> "l").
+_ZERO_LIKE_RE = re.compile(
+    r'll|ii|il|iI|Il|OO|oo|Oo|oO|DD|dd|QO|OQ',
+    re.IGNORECASE,
+)
+
+
+def map_ocr_glyphs_to_digits(text: str) -> str:
+    """Map common letter confusions to digits for jersey-sized OCR."""
+    t = (text or '').strip()
+    if not t:
+        return ''
+    t = _ZERO_LIKE_RE.sub('0', t)
+    out: list[str] = []
+    for ch in t:
+        if ch.isdigit():
+            out.append(ch)
+        elif ch in 'lI|!':
+            out.append('1')
+        elif ch in 'OoDdQ':
+            out.append('0')
+        elif ch in 'Ss':
+            out.append('5')
+        elif ch in 'Bb':
+            out.append('8')
+        elif ch in 'Zz':
+            out.append('2')
+        elif ch in 'Gg':
+            out.append('9')
+        elif ch in 'Tt':
+            out.append('7')
+    return ''.join(out)
+
+
+def glyph_digits_from_text(text: str, *, map_glyphs: bool) -> str:
+    if map_glyphs:
+        return map_ocr_glyphs_to_digits(text)
+    return re.sub(r'\D', '', text or '')
+
+
+def prefer_two_digit_candidates(
+        cands: list[tuple[int, float, str]]) -> list[tuple[int, float, str]]:
+    """When a crop yields both '1' and '10', keep the two-digit read."""
+    if len(cands) <= 1:
+        return cands
+    two = [c for c in cands if len(c[2]) >= 2]
+    if not two:
+        return cands
+    two_nums = {c[0] for c in two}
+    kept_one: list[tuple[int, float, str]] = []
+    for n, conf, raw in cands:
+        if len(raw) >= 2:
+            continue
+        if any(t // 10 == n and t != n for t in two_nums):
+            continue
+        kept_one.append((n, conf, raw))
+    two.sort(key=lambda x: -x[1])
+    kept_one.sort(key=lambda x: -x[1])
+    return two + kept_one
+
+
 def merge_split_digit_boxes(
-        raw: list[tuple[list, str, float]]) -> list[tuple[str, float]]:
+        raw: list[tuple[list, str, float]],
+        *,
+        map_glyphs: bool = False,
+) -> list[tuple[str, float]]:
     """Join left-to-right digit boxes on the same text line (e.g. '1' + '0' -> '10')."""
     cells = []
     for bbox, text, conf in raw:
-        digits = re.sub(r'\D', '', text or '')
+        digits = glyph_digits_from_text(text, map_glyphs=map_glyphs)
         if not digits:
             continue
         xs = [float(p[0]) for p in bbox]
@@ -207,7 +271,7 @@ class OcrEngine:
             self,
             gpu: bool,
             paragraph: bool = True,
-            include_no_allowlist: bool = False,
+            include_no_allowlist: bool = True,
     ):
         self._reader = None
         self._gpu = gpu
@@ -236,39 +300,65 @@ class OcrEngine:
             kw['allowlist'] = allowlist
         return normalize_readtext_rows(self._reader.readtext(rgb, **kw))
 
-    def collect_raw_for_merge(
-            self, bgr: np.ndarray, *, include_no_allowlist: bool = False,
-    ) -> list[tuple[list, str, float]]:
-        """Allowlist reads (paragraph False + optional True); dedupe before merge."""
+    def _raw_allowlist(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
         combined: list[tuple[list, str, float]] = []
         combined.extend(
             self.readtext_raw(bgr, paragraph=False, allowlist='0123456789'))
         if self.paragraph:
             combined.extend(
                 self.readtext_raw(bgr, paragraph=True, allowlist='0123456789'))
-        if include_no_allowlist:
-            combined.extend(
-                self.readtext_raw(bgr, paragraph=True, allowlist=None))
         return dedupe_raw_boxes(combined)
+
+    def _raw_no_allowlist(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
+        combined: list[tuple[list, str, float]] = []
+        combined.extend(self.readtext_raw(bgr, paragraph=False, allowlist=None))
+        if self.paragraph:
+            combined.extend(self.readtext_raw(bgr, paragraph=True, allowlist=None))
+        return dedupe_raw_boxes(combined)
+
+    def collect_raw_for_merge(
+            self, bgr: np.ndarray, *, include_no_allowlist: bool = False,
+    ) -> list[tuple[list, str, float]]:
+        """Allowlist reads (paragraph False + optional True); dedupe before merge."""
+        combined = self._raw_allowlist(bgr)
+        if include_no_allowlist:
+            combined.extend(self._raw_no_allowlist(bgr))
+        return dedupe_raw_boxes(combined)
+
+    def _merged_candidates(
+            self,
+            raw: list[tuple[list, str, float]],
+            *,
+            map_glyphs: bool,
+    ) -> list[tuple[int, float, str]]:
+        out: list[tuple[int, float, str]] = []
+        for merged_text, conf in merge_split_digit_boxes(
+                raw, map_glyphs=map_glyphs):
+            num = parse_jersey_number(merged_text)
+            if num is None:
+                continue
+            out.append((num, float(conf), merged_text))
+        return out
 
     def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float, str]]:
         """Returns (jersey number, confidence, raw merged digit string)."""
         if bgr.size == 0:
             return []
-        raw = self.collect_raw_for_merge(
-            bgr, include_no_allowlist=self.include_no_allowlist)
-        out: list[tuple[int, float, str]] = []
-        seen: set[tuple[int, float]] = set()
-        for merged_text, conf in merge_split_digit_boxes(raw):
-            num = parse_jersey_number(merged_text)
-            if num is None:
-                continue
-            key = (num, round(conf, 3))
+        cands: list[tuple[int, float, str]] = []
+        cands.extend(self._merged_candidates(
+            self._raw_allowlist(bgr), map_glyphs=False))
+        if self.include_no_allowlist:
+            cands.extend(self._merged_candidates(
+                self._raw_no_allowlist(bgr), map_glyphs=True))
+        seen: set[tuple[int, str]] = set()
+        deduped: list[tuple[int, float, str]] = []
+        for num, conf, raw in sorted(cands, key=lambda x: -x[1]):
+            key = (num, raw)
             if key in seen:
                 continue
             seen.add(key)
-            out.append((num, float(conf), merged_text))
-        return out
+            deduped.append((num, conf, raw))
+        return prefer_two_digit_candidates(deduped)
 
     def debug_all_modes(self, bgr: np.ndarray) -> dict[str, list[dict]]:
         modes = {
@@ -326,20 +416,35 @@ def run_fragment_ocr_debug(
             for b in boxes:
                 print(f"      text={b['text']!r} conf={b['confidence']} "
                       f"x=[{b['xmin']},{b['xmax']}]")
-        raw_combined = ocr.collect_raw_for_merge(up, include_no_allowlist=True)
-        print(f'    [combined pre-merge] {len(raw_combined)} box(es)')
-        for _bbox, text, conf in raw_combined:
+        raw_allow = ocr._raw_allowlist(up)
+        raw_free = ocr._raw_no_allowlist(up)
+        print(f'    [allowlist pre-merge] {len(raw_allow)} box(es)')
+        for _bbox, text, conf in raw_allow:
             print(f'      text={text!r} conf={round(float(conf), 4)}')
-        merged = merge_split_digit_boxes(raw_combined)
-        print(f'    [after merge] {merged!r}')
+        print(f'    [no-allowlist pre-merge] {len(raw_free)} box(es)')
+        for _bbox, text, conf in raw_free:
+            mapped = map_ocr_glyphs_to_digits(text)
+            print(f'      text={text!r} -> digits={mapped!r} conf={round(float(conf), 4)}')
+        merged_allow = merge_split_digit_boxes(raw_allow, map_glyphs=False)
+        merged_map = merge_split_digit_boxes(raw_free, map_glyphs=True)
+        reads = ocr.read_digits(up)
+        print(f'    [after merge allowlist] {merged_allow!r}')
+        print(f'    [after merge mapped no-allowlist] {merged_map!r}')
+        print(f'    [read_digits] {reads!r}')
 
         tag = f'frag{fragment_id}_f{fnum}'
         cv2.imwrite(str(out_dir / f'debug_{tag}_up.jpg'), up)
         samples_out.append({
             **crop_info,
             'easyocr_modes': modes,
-            'combined_pre_merge': serialize_easyocr_boxes(raw_combined),
-            'merged': [{'digits': t, 'confidence': c} for t, c in merged],
+            'allowlist_pre_merge': serialize_easyocr_boxes(raw_allow),
+            'no_allowlist_pre_merge': serialize_easyocr_boxes(raw_free),
+            'merged_allowlist': [{'digits': t, 'confidence': c} for t, c in merged_allow],
+            'merged_glyph_mapped': [{'digits': t, 'confidence': c} for t, c in merged_map],
+            'read_digits': [
+                {'number': n, 'confidence': c, 'raw_digits': raw}
+                for n, c, raw in reads
+            ],
         })
 
     out_path = out_dir / f'debug_fragment_{fragment_id}.json'
@@ -687,6 +792,10 @@ def eligible_fragments(
 def json_safe(obj):
     if isinstance(obj, Path):
         return str(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return json_safe(obj.tolist())
     if isinstance(obj, dict):
         return {k: json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -834,8 +943,10 @@ def main() -> None:
                     help='With --debug-fragment, run debug then exit (no full probe)')
     ap.add_argument('--no-ocr-paragraph', action='store_true',
                     help='EasyOCR paragraph=False only (skip paragraph=True pass)')
+    ap.add_argument('--skip-ocr-no-allowlist', action='store_true',
+                    help='Skip no-allowlist OCR pass (glyph mapping for 0->ll etc.)')
     ap.add_argument('--ocr-no-allowlist-pass', action='store_true',
-                    help='Also run paragraph=True without digit allowlist (noisy)')
+                    help=argparse.SUPPRESS)
     ap.add_argument('--cpu', action='store_true',
                     help='EasyOCR on CPU (default: GPU)')
     ap.add_argument('--contact-n', type=int, default=40)
@@ -938,10 +1049,13 @@ def main() -> None:
         args.video, start_frame, needed_frames)
 
     track_by_id = {int(tr['id']): tr for tr in iter_dump_tracks(dump)}
+    include_no_allowlist = not args.skip_ocr_no_allowlist
+    if args.ocr_no_allowlist_pass:
+        include_no_allowlist = True
     ocr = OcrEngine(
         gpu=not args.cpu,
         paragraph=not args.no_ocr_paragraph,
-        include_no_allowlist=args.ocr_no_allowlist_pass,
+        include_no_allowlist=include_no_allowlist,
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
