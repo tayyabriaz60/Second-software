@@ -549,6 +549,13 @@ def run_fragment_ocr_debug(
         }), indent=2),
         encoding='utf-8')
     print(f'\n  Wrote {out_path}')
+    if paddle is not None:
+        cmp = print_engine_compare_table(
+            fragment_id, samples_out,
+            use_preprocessed=not args.no_ocr_preprocess)
+        cmp_path = out_dir / f'engine_compare_frag{fragment_id}.json'
+        cmp_path.write_text(json.dumps(json_safe(cmp), indent=2), encoding='utf-8')
+        print(f'  Wrote {cmp_path}')
 
 
 def majority_stats(reads: list[tuple[int, float]]) -> tuple[int | None, int, float]:
@@ -964,6 +971,23 @@ def overlay_read_on_crop(crop: np.ndarray, label: str) -> np.ndarray:
     return img
 
 
+def _thumb_fit_cell(
+        crop: np.ndarray, thumb_h: int, thumb_w: int) -> np.ndarray:
+    """Resize crop to fit inside (thumb_w x thumb_h), letterboxed."""
+    canvas = np.full((thumb_h, thumb_w, 3), 240, dtype=np.uint8)
+    if crop.size == 0:
+        return canvas
+    ch, cw = crop.shape[:2]
+    scale = min(thumb_h / max(ch, 1), thumb_w / max(cw, 1))
+    tw = max(1, int(round(cw * scale)))
+    th = max(1, int(round(ch * scale)))
+    resized = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
+    y0 = (thumb_h - th) // 2
+    x0 = (thumb_w - tw) // 2
+    canvas[y0:y0 + th, x0:x0 + tw] = resized
+    return canvas
+
+
 def build_contact_sheet(
     entries: list[dict],
     out_path: Path,
@@ -975,7 +999,8 @@ def build_contact_sheet(
     rows = int(math.ceil(len(entries) / cols))
     pad = 8
     label_h = 36
-    cell_w = int(thumb_h * 0.85) + pad * 2
+    thumb_w = int(thumb_h * 0.85)
+    cell_w = thumb_w + pad * 2
     cell_h = thumb_h + label_h + pad * 2
     sheet = np.full((rows * cell_h, cols * cell_w, 3), 240, dtype=np.uint8)
 
@@ -984,12 +1009,8 @@ def build_contact_sheet(
         y0 = r * cell_h + pad
         x0 = c * cell_w + pad
         crop = ent['thumb']
-        if crop.size == 0:
-            continue
-        scale = thumb_h / max(crop.shape[0], 1)
-        tw = max(1, int(crop.shape[1] * scale))
-        thumb = cv2.resize(crop, (tw, thumb_h), interpolation=cv2.INTER_AREA)
-        sheet[y0:y0 + thumb_h, x0:x0 + tw] = thumb
+        thumb = _thumb_fit_cell(crop, thumb_h, thumb_w)
+        sheet[y0:y0 + thumb_h, x0:x0 + thumb_w] = thumb
         for li, line in enumerate(ent['label'].split('\n')[:2]):
             cv2.putText(
                 sheet, line[:32], (x0, y0 + thumb_h + 14 + li * 16),
@@ -997,6 +1018,161 @@ def build_contact_sheet(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), sheet)
+
+
+def _best_read_num(reads: list[tuple[int, float, str]]) -> int | None:
+    if not reads:
+        return None
+    return int(reads[0][0])
+
+
+def _reads_summary(reads: list[tuple[int, float, str]]) -> str:
+    if not reads:
+        return '—'
+    return ','.join(f'{n}({c:.2f})' for n, c, _ in reads[:3])
+
+
+def print_engine_compare_table(
+        fragment_id: int,
+        samples: list[dict],
+        *,
+        use_preprocessed: bool,
+) -> dict:
+    """Side-by-side EasyOCR vs Paddle on corrected crops."""
+    key_easy = 'easyocr_preprocessed' if use_preprocessed else 'easyocr_raw'
+    key_pad = 'paddle_preprocessed' if use_preprocessed else 'paddle_raw'
+    print(f'\n=== Engine compare fragment {fragment_id} '
+          f'({"preprocessed" if use_preprocessed else "raw"} crop) ===')
+    print(f'{"frame":>8}  {"easy":>6}  {"paddle":>6}  easy reads          paddle reads')
+    rows = []
+    n_paddle_10 = n_easy_10 = 0
+    n_both = 0
+    for s in samples:
+        fnum = s['frame']
+        eb = s.get(key_easy) or {}
+        pb = s.get(key_pad)
+        easy_r = eb.get('read_digits') or []
+        pad_r = (pb or {}).get('read_digits') or []
+        en = easy_r[0]['number'] if easy_r else None
+        pn = pad_r[0]['number'] if pad_r else None
+        if pn is not None:
+            n_both += 1
+        if en == 10:
+            n_easy_10 += 1
+        if pn == 10:
+            n_paddle_10 += 1
+        es = en if en is not None else '—'
+        ps = pn if pn is not None else '—'
+        print(f'{fnum:8d}  {es!s:>6}  {ps!s:>6}  {_reads_summary([(r["number"], r["confidence"], r.get("raw_digits","")) for r in easy_r])!s:18}  {_reads_summary([(r["number"], r["confidence"], r.get("raw_digits","")) for r in pad_r]) if pad_r else "—"}')
+        rows.append({'frame': fnum, 'easy': en, 'paddle': pn})
+    print(f'\n  Frames with paddle read: {n_both}/{len(samples)}')
+    print(f'  EasyOCR read 10 on {n_easy_10} frame(s); Paddle read 10 on {n_paddle_10} frame(s)')
+    if n_paddle_10 > n_easy_10:
+        print('  Verdict: Paddle reads 10 more often — try --ocr-engine paddle and re-run probe.')
+    elif n_paddle_10 == 0 and n_easy_10 == 0:
+        print('  Verdict: Neither engine read 10 — off-the-shelf OCR likely insufficient; '
+              'train a digit model on these crops.')
+    else:
+        print('  Verdict: Paddle did not beat EasyOCR on digit 10 — same resolution limit.')
+    return {'fragment_id': fragment_id, 'rows': rows,
+            'easy_frames_with_10': n_easy_10, 'paddle_frames_with_10': n_paddle_10}
+
+
+def make_probe_ocr(args) -> OcrEngine | PaddleOcrEngine:
+    gpu = not args.cpu
+    if args.ocr_engine == 'paddle':
+        return PaddleOcrEngine(gpu=gpu)
+    return OcrEngine(
+        gpu=gpu,
+        paragraph=not args.no_ocr_paragraph,
+    )
+
+
+def thumbs_from_report(
+        report_frags: list[dict],
+        track_by_id: dict,
+        frame_cache: dict[int, np.ndarray],
+        frame_h: float,
+        dump: dict,
+        args,
+) -> list[dict]:
+    """Rebuild _thumb / _overlay rows from a saved report (no OCR)."""
+    tracks = list(track_by_id.values())
+    y_model = fit_y_height_model(tracks, frame_h, dump)
+    out = []
+    for f in report_frags:
+        tid = int(f['fragment_id'])
+        tr = track_by_id.get(tid)
+        if tr is None:
+            continue
+        hs = per_track_heights(tr, frame_h, y_model, dump)
+        frames = tr['frames']
+        if len(hs) != len(frames):
+            hs = (hs + [0.0] * len(frames))[:len(frames)]
+        best_crop = None
+        best_conf = -1.0
+        for ps in f.get('per_sample', []):
+            fnum = int(ps['frame'])
+            frame = frame_cache.get(fnum)
+            if frame is None:
+                continue
+            try:
+                fi = frames.index(fnum)
+            except ValueError:
+                continue
+            cx, cy, h = sample_centre_and_height(tr, fi, hs)
+            crop, _ = centre_torso_crop(
+                frame, cx, cy, h, width_margin=args.torso_width_margin)
+            up = upscale(crop, args.upscale)
+            img = (
+                preprocess_for_ocr(up) if not args.no_ocr_preprocess else up)
+            reads = ps.get('reads') or []
+            conf = max((float(r.get('confidence', 0)) for r in reads), default=0.0)
+            if conf > best_conf or best_crop is None:
+                best_conf = conf
+                best_crop = img.copy()
+        maj = f.get('majority_number')
+        n_reads = int(f.get('n_successful_reads') or 0)
+        maj_count = int(f.get('majority_count') or 0)
+        overlay = (
+            f'#{maj} ({maj_count}/{n_reads})' if maj is not None else 'no read')
+        out.append({
+            'fragment_id': tid,
+            'team': f.get('team'),
+            'consistent': bool(f.get('consistent')),
+            '_thumb': best_crop,
+            '_overlay': overlay,
+        })
+    return out
+
+
+def rebuild_contact_sheet(
+        out_path: Path,
+        results_with_thumbs: list[dict],
+        replay_ids: list[int] | None,
+        contact_n: int,
+        seed: int,
+) -> None:
+    """Build contact sheet from in-memory results (same pick logic as main)."""
+    contact_pool = [r for r in results_with_thumbs if r.get('_thumb') is not None]
+    if not contact_pool:
+        print('  rebuild-contact-sheet: no thumbnails')
+        return
+    if replay_ids:
+        by_id = {r['fragment_id']: r for r in contact_pool}
+        contact_pick = [by_id[fid] for fid in replay_ids if fid in by_id]
+    else:
+        rng = random.Random(seed)
+        contact_pick = rng.sample(
+            contact_pool, min(contact_n, len(contact_pool)))
+    contact_entries = []
+    for r in contact_pick:
+        thumb = overlay_read_on_crop(r['_thumb'], r['_overlay'])
+        label = (f"frag {r['fragment_id']} team {r['team']}\n"
+                 f"{r['_overlay']} {'OK' if r['consistent'] else 'weak'}")
+        contact_entries.append({'thumb': thumb, 'label': label})
+    build_contact_sheet(contact_entries, out_path)
+    print(f'  Contact sheet: {out_path}')
 
 
 def main() -> None:
@@ -1037,6 +1213,13 @@ def main() -> None:
                     help='Skip CLAHE + sharpen before OCR (debug compares raw vs pre)')
     ap.add_argument('--no-paddle-debug', action='store_true',
                     help='With --debug-fragment, skip PaddleOCR comparison')
+    ap.add_argument('--compare-engines', action='store_true',
+                    help='With --debug-fragment: require Paddle + print side-by-side table')
+    ap.add_argument('--rebuild-contact-sheet', action='store_true',
+                    help='Rebuild jersey_ocr_contact_sheet.jpg from existing '
+                         'jersey_ocr_report.json + video (no full re-OCR)')
+    ap.add_argument('--ocr-engine', choices=('easyocr', 'paddle'), default='easyocr',
+                    help='OCR backend for probe runs (use paddle if engine compare wins)')
     ap.add_argument('--cpu', action='store_true',
                     help='EasyOCR on CPU (default: GPU)')
     ap.add_argument('--contact-n', type=int, default=40)
@@ -1133,13 +1316,34 @@ def main() -> None:
     if args.video is None:
         raise SystemExit('--video is required unless --eligible-only')
 
+    track_by_id = {int(tr['id']): tr for tr in iter_dump_tracks(dump)}
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    frame_h = float(dump.get('height') or 0)
+
+    if args.rebuild_contact_sheet:
+        report_path = args.out_dir / 'jersey_ocr_report.json'
+        if not report_path.is_file():
+            raise SystemExit(f'--rebuild-contact-sheet needs {report_path}')
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+        frags = report.get('fragments') or []
+        need: set[int] = set()
+        for f in frags:
+            for ps in f.get('per_sample', []):
+                need.add(int(ps['frame']))
+        print(f'Rebuild contact sheet: {len(frags)} fragments, {len(need)} frames')
+        frame_cache = read_video_frames_sequential(
+            args.video, start_frame, need)
+        thumbs = thumbs_from_report(
+            frags, track_by_id, frame_cache, frame_h, dump, args)
+        sheet_path = args.out_dir / 'jersey_ocr_contact_sheet.jpg'
+        rebuild_contact_sheet(
+            sheet_path, thumbs, replay_ids, args.contact_n, args.seed)
+        return
+
     print(f'Sequential read from dump start_frame={start_frame} (no seek)...')
 
     frame_cache = read_video_frames_sequential(
         args.video, start_frame, needed_frames)
-
-    track_by_id = {int(tr['id']): tr for tr in iter_dump_tracks(dump)}
-    args.out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.debug_fragment is not None:
         fid = int(args.debug_fragment)
@@ -1156,11 +1360,15 @@ def main() -> None:
             paragraph=not args.no_ocr_paragraph,
         )
         paddle_dbg: PaddleOcrEngine | None = None
-        if not args.no_paddle_debug:
+        want_paddle = args.compare_engines or not args.no_paddle_debug
+        if want_paddle:
             try:
                 paddle_dbg = PaddleOcrEngine(gpu=not args.cpu)
                 print('PaddleOCR: loaded for debug comparison')
             except Exception as exc:
+                if args.compare_engines:
+                    raise SystemExit(
+                        f'--compare-engines requires PaddleOCR: {exc}')
                 print(f'PaddleOCR not available ({exc}) — '
                       f'install paddlepaddle-gpu paddleocr to compare')
         run_fragment_ocr_debug(
@@ -1169,10 +1377,11 @@ def main() -> None:
         if args.debug_only:
             return
 
-    ocr = OcrEngine(
-        gpu=not args.cpu,
-        paragraph=not args.no_ocr_paragraph,
-    )
+    ocr = make_probe_ocr(args)
+    if args.ocr_engine == 'paddle':
+        print('OCR engine: PaddleOCR')
+    else:
+        print('OCR engine: EasyOCR')
     results = []
 
     for fi, meta in enumerate(eligible):
@@ -1299,24 +1508,9 @@ def main() -> None:
         json.dumps(json_safe(payload), indent=2), encoding='utf-8')
     print(f'\n  Report: {report_path}')
 
-    contact_pool = [r for r in results if r['_thumb'] is not None]
-    if replay_ids:
-        by_id = {r['fragment_id']: r for r in contact_pool}
-        contact_pick = [by_id[fid] for fid in replay_ids if fid in by_id]
-    else:
-        rng = random.Random(args.seed)
-        contact_pick = rng.sample(
-            contact_pool, min(args.contact_n, len(contact_pool)))
-    contact_entries = []
-    for r in contact_pick:
-        thumb = overlay_read_on_crop(r['_thumb'], r['_overlay'])
-        label = (f"frag {r['fragment_id']} team {r['team']}\n"
-                 f"{r['_overlay']} {'OK' if r['consistent'] else 'weak'}")
-        contact_entries.append({'thumb': thumb, 'label': label})
-
     sheet_path = args.out_dir / 'jersey_ocr_contact_sheet.jpg'
-    build_contact_sheet(contact_entries, sheet_path)
-    print(f'  Contact sheet: {sheet_path}')
+    rebuild_contact_sheet(
+        sheet_path, results, replay_ids, args.contact_n, args.seed)
 
 
 if __name__ == '__main__':
