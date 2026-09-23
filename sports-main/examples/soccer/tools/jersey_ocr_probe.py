@@ -1349,6 +1349,37 @@ def thumbs_from_report(
     return out
 
 
+def pick_report_fragments_for_contact(
+        report_frags: list[dict],
+        replay_ids: list[int] | None,
+        contact_n: int,
+        seed: int,
+) -> list[dict]:
+    pool = [f for f in report_frags if f.get('per_sample')]
+    if not pool:
+        return []
+    if replay_ids:
+        by_id = {int(f['fragment_id']): f for f in pool}
+        return [by_id[fid] for fid in replay_ids if fid in by_id]
+    rng = random.Random(seed)
+    return rng.sample(pool, min(contact_n, len(pool)))
+
+
+def best_contact_frame_from_report(frag: dict) -> int | None:
+    """One frame per fragment for contact rebuild (from saved reads, no OCR)."""
+    per = frag.get('per_sample') or []
+    if not per:
+        return None
+    best_f, best_c = None, -1.0
+    for ps in per:
+        reads = ps.get('reads') or []
+        conf = max((float(r.get('confidence', 0)) for r in reads), default=0.0)
+        if conf > best_c or best_f is None:
+            best_c = conf
+            best_f = int(ps['frame'])
+    return best_f if best_f is not None else int(per[0]['frame'])
+
+
 def rebuild_contact_sheet(
         out_path: Path,
         results_with_thumbs: list[dict],
@@ -1528,19 +1559,27 @@ def main() -> None:
         if not report_path.is_file():
             raise SystemExit(f'--rebuild-contact-sheet needs {report_path}')
         report = json.loads(report_path.read_text(encoding='utf-8'))
-        frags = report.get('fragments') or []
+        all_frags = report.get('fragments') or []
+        picked = pick_report_fragments_for_contact(
+            all_frags, replay_ids, args.contact_n, args.seed)
         need: set[int] = set()
-        for f in frags:
-            for ps in f.get('per_sample', []):
-                need.add(int(ps['frame']))
-        print(f'Rebuild contact sheet: {len(frags)} fragments, {len(need)} frames')
+        for f in picked:
+            bf = best_contact_frame_from_report(f)
+            if bf is not None:
+                need.add(bf)
+        print(f'Rebuild contact sheet: {len(picked)} tile(s) from report '
+              f'({len(all_frags)} fragments total), decode {len(need)} frame(s)')
+        if need:
+            cmin, cmax = min(need), max(need)
+            print(f'  Clip frame range for tiles: {cmin}..{cmax}')
         frame_cache = read_video_frames_sequential(
             args.video, start_frame, need)
         thumbs = thumbs_from_report(
-            frags, track_by_id, frame_cache, frame_h, dump, args)
+            picked, track_by_id, frame_cache, frame_h, dump, args)
         sheet_path = args.out_dir / 'jersey_ocr_contact_sheet.jpg'
         rebuild_contact_sheet(
-            sheet_path, thumbs, replay_ids, args.contact_n, args.seed)
+            sheet_path, thumbs, replay_ids=None, contact_n=args.contact_n,
+            seed=args.seed)
         return
 
     print(f'Sequential read from dump start_frame={start_frame} (no seek)...')
