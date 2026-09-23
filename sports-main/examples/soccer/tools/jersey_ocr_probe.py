@@ -5,6 +5,7 @@ Uses a track_dump JSON only — does not modify main.py or assign_identities.py.
 
 Usage (RunPod, from sports-main/examples/soccer):
   pip install easyocr opencv-python-headless
+  # Debug Paddle compare: pip install paddlepaddle-gpu paddleocr  (or paddlepaddle on CPU)
   python tools/jersey_ocr_probe.py \\
     --dump data/id_lists/track_dump_clip10min_deliver_v2.json \\
     --video /workspace/clip10min.mp4 \\
@@ -56,38 +57,42 @@ def _spread_indices(idxs: list[int], k: int) -> list[int]:
     return out
 
 
-def box_from_centre_h(cx: float, cy: float, h: float,
-                        width_frac: float) -> tuple[int, int, int, int]:
-    w = max(8.0, h * width_frac)
-    x1 = int(round(cx - w / 2))
-    x2 = int(round(cx + w / 2))
-    y1 = int(round(cy - h / 2))
-    y2 = int(round(cy + h / 2))
-    return x1, y1, x2, y2
+# Dump ``xy`` is the detector box centre (pass-1 ``_centre(xyxy)``), not the feet.
+# Torso window in units of box height h (see centre_torso_crop).
+TORSO_Y_ABOVE = 0.30   # y1 = cy - TORSO_Y_ABOVE * h
+TORSO_Y_BELOW = 0.05   # y2 = cy + TORSO_Y_BELOW * h
+TORSO_X_HALF = 0.18    # x1/x2 = cx ± TORSO_X_HALF * h
 
 
-def torso_crop(
+def centre_torso_crop(
     frame: np.ndarray,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    width_margin: float = 0.10,
-) -> np.ndarray:
-    """15–60% box height; default middle 80% of box width (10%–90%)."""
+    cx: float,
+    cy: float,
+    h: float,
+    width_margin: float = 0.0,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Crop jersey torso from box centre (cx, cy) and height h."""
+    if h <= 0 or frame.size == 0:
+        return np.zeros((0, 0, 3), dtype=np.uint8), (0, 0, 0, 0)
     fh, fw = frame.shape[:2]
+    hx = max(8.0, float(h) * TORSO_X_HALF)
+    hy_top = float(h) * TORSO_Y_ABOVE
+    hy_bot = float(h) * TORSO_Y_BELOW
+    x1 = int(round(cx - hx))
+    x2 = int(round(cx + hx))
+    y1 = int(round(cy - hy_top))
+    y2 = int(round(cy + hy_bot))
+    if width_margin > 0:
+        bw = x2 - x1
+        x1 += int(width_margin * bw)
+        x2 -= int(width_margin * bw)
     x1 = max(0, min(x1, fw - 1))
     x2 = max(x1 + 1, min(x2, fw))
     y1 = max(0, min(y1, fh - 1))
     y2 = max(y1 + 1, min(y2, fh))
-    bw, bh = x2 - x1, y2 - y1
-    tx1 = x1 + int(width_margin * bw)
-    tx2 = x1 + int((1.0 - width_margin) * bw)
-    ty1 = y1 + int(0.15 * bh)
-    ty2 = y1 + int(0.60 * bh)
-    if tx2 <= tx1 or ty2 <= ty1:
-        return np.zeros((0, 0, 3), dtype=np.uint8)
-    return frame[ty1:ty2, tx1:tx2].copy()
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros((0, 0, 3), dtype=np.uint8), (x1, y1, x2, y2)
+    return frame[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
 
 
 def upscale(crop: np.ndarray, scale: float) -> np.ndarray:
@@ -96,6 +101,20 @@ def upscale(crop: np.ndarray, scale: float) -> np.ndarray:
     nh = max(8, int(round(crop.shape[0] * scale)))
     nw = max(8, int(round(crop.shape[1] * scale)))
     return cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
+
+def preprocess_for_ocr(bgr: np.ndarray) -> np.ndarray:
+    """CLAHE contrast on L + mild sharpen for small jersey digits."""
+    if bgr.size == 0:
+        return bgr
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+    l_ch = clahe.apply(l_ch)
+    out = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    out = cv2.filter2D(out, -1, kernel)
+    return out
 
 
 def normalize_readtext_row(row) -> tuple[list, str, float]:
@@ -125,46 +144,6 @@ def parse_jersey_number(text: str) -> int | None:
     return None
 
 
-# EasyOCR often reads jersey digits as letters (e.g. 0 -> "ll", 1 -> "l").
-_ZERO_LIKE_RE = re.compile(
-    r'll|ii|il|iI|Il|OO|oo|Oo|oO|DD|dd|QO|OQ',
-    re.IGNORECASE,
-)
-
-
-def map_ocr_glyphs_to_digits(text: str) -> str:
-    """Map common letter confusions to digits for jersey-sized OCR."""
-    t = (text or '').strip()
-    if not t:
-        return ''
-    t = _ZERO_LIKE_RE.sub('0', t)
-    out: list[str] = []
-    for ch in t:
-        if ch.isdigit():
-            out.append(ch)
-        elif ch in 'lI|!':
-            out.append('1')
-        elif ch in 'OoDdQ':
-            out.append('0')
-        elif ch in 'Ss':
-            out.append('5')
-        elif ch in 'Bb':
-            out.append('8')
-        elif ch in 'Zz':
-            out.append('2')
-        elif ch in 'Gg':
-            out.append('9')
-        elif ch in 'Tt':
-            out.append('7')
-    return ''.join(out)
-
-
-def glyph_digits_from_text(text: str, *, map_glyphs: bool) -> str:
-    if map_glyphs:
-        return map_ocr_glyphs_to_digits(text)
-    return re.sub(r'\D', '', text or '')
-
-
 def prefer_two_digit_candidates(
         cands: list[tuple[int, float, str]]) -> list[tuple[int, float, str]]:
     """When a crop yields both '1' and '10', keep the two-digit read."""
@@ -187,14 +166,11 @@ def prefer_two_digit_candidates(
 
 
 def merge_split_digit_boxes(
-        raw: list[tuple[list, str, float]],
-        *,
-        map_glyphs: bool = False,
-) -> list[tuple[str, float]]:
+        raw: list[tuple[list, str, float]]) -> list[tuple[str, float]]:
     """Join left-to-right digit boxes on the same text line (e.g. '1' + '0' -> '10')."""
     cells = []
     for bbox, text, conf in raw:
-        digits = glyph_digits_from_text(text, map_glyphs=map_glyphs)
+        digits = re.sub(r'\D', '', text or '')
         if not digits:
             continue
         xs = [float(p[0]) for p in bbox]
@@ -271,12 +247,10 @@ class OcrEngine:
             self,
             gpu: bool,
             paragraph: bool = True,
-            include_no_allowlist: bool = True,
     ):
         self._reader = None
         self._gpu = gpu
         self.paragraph = paragraph
-        self.include_no_allowlist = include_no_allowlist
 
     def _lazy_init(self):
         if self._reader is not None:
@@ -309,56 +283,22 @@ class OcrEngine:
                 self.readtext_raw(bgr, paragraph=True, allowlist='0123456789'))
         return dedupe_raw_boxes(combined)
 
-    def _raw_no_allowlist(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
-        combined: list[tuple[list, str, float]] = []
-        combined.extend(self.readtext_raw(bgr, paragraph=False, allowlist=None))
-        if self.paragraph:
-            combined.extend(self.readtext_raw(bgr, paragraph=True, allowlist=None))
-        return dedupe_raw_boxes(combined)
-
-    def collect_raw_for_merge(
-            self, bgr: np.ndarray, *, include_no_allowlist: bool = False,
-    ) -> list[tuple[list, str, float]]:
+    def collect_raw_for_merge(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
         """Allowlist reads (paragraph False + optional True); dedupe before merge."""
-        combined = self._raw_allowlist(bgr)
-        if include_no_allowlist:
-            combined.extend(self._raw_no_allowlist(bgr))
-        return dedupe_raw_boxes(combined)
-
-    def _merged_candidates(
-            self,
-            raw: list[tuple[list, str, float]],
-            *,
-            map_glyphs: bool,
-    ) -> list[tuple[int, float, str]]:
-        out: list[tuple[int, float, str]] = []
-        for merged_text, conf in merge_split_digit_boxes(
-                raw, map_glyphs=map_glyphs):
-            num = parse_jersey_number(merged_text)
-            if num is None:
-                continue
-            out.append((num, float(conf), merged_text))
-        return out
+        return self._raw_allowlist(bgr)
 
     def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float, str]]:
         """Returns (jersey number, confidence, raw merged digit string)."""
         if bgr.size == 0:
             return []
+        raw = self._raw_allowlist(bgr)
         cands: list[tuple[int, float, str]] = []
-        cands.extend(self._merged_candidates(
-            self._raw_allowlist(bgr), map_glyphs=False))
-        if self.include_no_allowlist:
-            cands.extend(self._merged_candidates(
-                self._raw_no_allowlist(bgr), map_glyphs=True))
-        seen: set[tuple[int, str]] = set()
-        deduped: list[tuple[int, float, str]] = []
-        for num, conf, raw in sorted(cands, key=lambda x: -x[1]):
-            key = (num, raw)
-            if key in seen:
+        for merged_text, conf in merge_split_digit_boxes(raw):
+            num = parse_jersey_number(merged_text)
+            if num is None:
                 continue
-            seen.add(key)
-            deduped.append((num, conf, raw))
-        return prefer_two_digit_candidates(deduped)
+            cands.append((num, float(conf), merged_text))
+        return prefer_two_digit_candidates(cands)
 
     def debug_all_modes(self, bgr: np.ndarray) -> dict[str, list[dict]]:
         modes = {
@@ -374,6 +314,110 @@ class OcrEngine:
         return report
 
 
+def serialize_det_boxes(
+        raw: list[tuple[list, str, float]]) -> list[dict]:
+    """Serialize EasyOCR / PaddleOCR detection boxes for JSON debug."""
+    out = []
+    for bbox, text, conf in raw:
+        xs = [float(p[0]) for p in bbox]
+        ys = [float(p[1]) for p in bbox]
+        out.append({
+            'text': text,
+            'confidence': round(float(conf), 4),
+            'bbox': [[round(x, 1), round(y, 1)] for x, y in bbox],
+            'xmin': round(min(xs), 1),
+            'xmax': round(max(xs), 1),
+            'cy': round(sum(ys) / len(ys), 1),
+        })
+    return out
+
+
+class PaddleOcrEngine:
+    def __init__(self, gpu: bool):
+        self._ocr = None
+        self._gpu = gpu
+
+    def _lazy_init(self):
+        if self._ocr is not None:
+            return
+        from paddleocr import PaddleOCR
+        self._ocr = PaddleOCR(
+            use_angle_cls=False,
+            lang='en',
+            use_gpu=self._gpu,
+            show_log=False,
+        )
+
+    def readtext_raw(self, bgr: np.ndarray) -> list[tuple[list, str, float]]:
+        if bgr.size == 0:
+            return []
+        self._lazy_init()
+        pages = self._ocr.ocr(bgr, cls=False)
+        if not pages:
+            return []
+        out: list[tuple[list, str, float]] = []
+        for page in pages:
+            if not page:
+                continue
+            for box, (text, conf) in page:
+                out.append((box, text, float(conf)))
+        return out
+
+    def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float, str]]:
+        raw = self.readtext_raw(bgr)
+        cands: list[tuple[int, float, str]] = []
+        for merged_text, conf in merge_split_digit_boxes(raw):
+            num = parse_jersey_number(merged_text)
+            if num is None:
+                continue
+            cands.append((num, float(conf), merged_text))
+        for _bbox, text, conf in raw:
+            num = parse_jersey_number(text)
+            if num is not None:
+                cands.append((num, float(conf), re.sub(r'\D', '', text or '')))
+        seen: set[tuple[int, str]] = set()
+        deduped: list[tuple[int, float, str]] = []
+        for num, c, raw_s in sorted(cands, key=lambda x: -x[1]):
+            key = (num, raw_s)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((num, c, raw_s))
+        return prefer_two_digit_candidates(deduped)
+
+
+def export_fragment_crops(
+        fragment_id: int,
+        meta: dict,
+        tr: dict,
+        frame_cache: dict[int, np.ndarray],
+        args,
+        out_dir: Path,
+) -> Path:
+    """Write upscaled (and optional preprocessed) torso crops — no OCR."""
+    frames = meta['frames']
+    hs = meta['heights']
+    crops_dir = out_dir / f'crops_frag{fragment_id}'
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for si in meta['sample_idx']:
+        fnum = int(frames[si])
+        frame = frame_cache.get(fnum)
+        if frame is None:
+            continue
+        cx, cy, h = sample_centre_and_height(tr, si, hs)
+        crop, (x1, y1, x2, y2) = centre_torso_crop(
+            frame, cx, cy, h, width_margin=args.torso_width_margin)
+        up = upscale(crop, args.upscale)
+        tag = f'frag{fragment_id}_f{fnum}'
+        cv2.imwrite(str(crops_dir / f'{tag}_up.jpg'), up)
+        if not args.no_ocr_preprocess:
+            cv2.imwrite(str(crops_dir / f'{tag}_pre.jpg'), preprocess_for_ocr(up))
+        n += 1
+    print(f'Wrote {n} crop(s) to {crops_dir}/')
+    return crops_dir
+
+
 def run_fragment_ocr_debug(
         fragment_id: int,
         meta: dict,
@@ -382,15 +426,20 @@ def run_fragment_ocr_debug(
         ocr: OcrEngine,
         args,
         out_dir: Path,
+        paddle: PaddleOcrEngine | None = None,
 ) -> None:
     """Print and write pre-merge EasyOCR boxes for one fragment."""
     frames = meta['frames']
     hs = meta['heights']
     samples_out = []
     print(f'\n=== OCR debug fragment {fragment_id} ===')
-    print(f'  torso_width_margin={args.torso_width_margin} '
-          f'(middle {(1 - 2 * args.torso_width_margin) * 100:.0f}% of est. box width)')
-    print(f'  width_frac={args.width_frac} upscale={args.upscale}')
+    print(f'  crop: centre (cx,cy)+h — y=[cy-{TORSO_Y_ABOVE}h, cy+{TORSO_Y_BELOW}h], '
+          f'x=±{TORSO_X_HALF}h (dump xy is box centre, not feet)')
+    print(f'  torso_width_margin={args.torso_width_margin} upscale={args.upscale}')
+    print(f'  ocr_preprocess={not args.no_ocr_preprocess}')
+    crops_dir = out_dir / f'crops_frag{fragment_id}'
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    print(f'  Saving upscaled crops -> {crops_dir}/')
 
     for si in meta['sample_idx']:
         fnum = int(frames[si])
@@ -398,53 +447,90 @@ def run_fragment_ocr_debug(
         if frame is None:
             continue
         cx, cy, h = sample_centre_and_height(tr, si, hs)
-        x1, y1, x2, y2 = box_from_centre_h(cx, cy, h, args.width_frac)
-        crop = torso_crop(
-            frame, x1, y1, x2, y2, width_margin=args.torso_width_margin)
+        crop, (x1, y1, x2, y2) = centre_torso_crop(
+            frame, cx, cy, h, width_margin=args.torso_width_margin)
         up = upscale(crop, args.upscale)
+        up_pp = preprocess_for_ocr(up) if not args.no_ocr_preprocess else up
         crop_info = {
             'frame': fnum,
-            'box_xyxy': [x1, y1, x2, y2],
+            'centre_xy': [round(cx, 1), round(cy, 1)],
+            'box_h': round(h, 1),
+            'torso_xyxy': [x1, y1, x2, y2],
             'torso_px': [int(crop.shape[1]), int(crop.shape[0])],
             'upscaled_px': [int(up.shape[1]), int(up.shape[0])],
             'width_margin': args.torso_width_margin,
         }
-        modes = ocr.debug_all_modes(up)
-        print(f'\n  frame {fnum} crop {crop_info["torso_px"]} -> up {crop_info["upscaled_px"]}')
-        for mode_name, boxes in modes.items():
-            print(f'    [{mode_name}] {len(boxes)} box(es)')
-            for b in boxes:
-                print(f"      text={b['text']!r} conf={b['confidence']} "
-                      f"x=[{b['xmin']},{b['xmax']}]")
-        raw_allow = ocr._raw_allowlist(up)
-        raw_free = ocr._raw_no_allowlist(up)
-        print(f'    [allowlist pre-merge] {len(raw_allow)} box(es)')
-        for _bbox, text, conf in raw_allow:
-            print(f'      text={text!r} conf={round(float(conf), 4)}')
-        print(f'    [no-allowlist pre-merge] {len(raw_free)} box(es)')
-        for _bbox, text, conf in raw_free:
-            mapped = map_ocr_glyphs_to_digits(text)
-            print(f'      text={text!r} -> digits={mapped!r} conf={round(float(conf), 4)}')
-        merged_allow = merge_split_digit_boxes(raw_allow, map_glyphs=False)
-        merged_map = merge_split_digit_boxes(raw_free, map_glyphs=True)
-        reads = ocr.read_digits(up)
-        print(f'    [after merge allowlist] {merged_allow!r}')
-        print(f'    [after merge mapped no-allowlist] {merged_map!r}')
-        print(f'    [read_digits] {reads!r}')
-
         tag = f'frag{fragment_id}_f{fnum}'
-        cv2.imwrite(str(out_dir / f'debug_{tag}_up.jpg'), up)
+        cv2.imwrite(str(crops_dir / f'{tag}_up.jpg'), up)
+        if not args.no_ocr_preprocess:
+            cv2.imwrite(str(crops_dir / f'{tag}_pre.jpg'), up_pp)
+
+        def _easy_report(label: str, img: np.ndarray) -> dict:
+            modes = ocr.debug_all_modes(img)
+            raw_allow = ocr._raw_allowlist(img)
+            merged = merge_split_digit_boxes(raw_allow)
+            reads = ocr.read_digits(img)
+            print(f'\n  frame {fnum} [{label}] {crop_info["upscaled_px"]}')
+            for mode_name, boxes in modes.items():
+                print(f'    [easyocr {mode_name}] {len(boxes)} box(es)')
+                for b in boxes:
+                    print(f"      text={b['text']!r} conf={b['confidence']} "
+                          f"x=[{b['xmin']},{b['xmax']}]")
+            print(f'    [easyocr allowlist merge] {merged!r} read_digits={reads!r}')
+            return {
+                'easyocr_modes': modes,
+                'allowlist_pre_merge': serialize_det_boxes(raw_allow),
+                'merged_allowlist': [{'digits': t, 'confidence': c} for t, c in merged],
+                'read_digits': [
+                    {'number': n, 'confidence': c, 'raw_digits': raw}
+                    for n, c, raw in reads
+                ],
+            }
+
+        easy_raw = _easy_report('raw upscale', up)
+        easy_pp = (
+            _easy_report('preprocessed', up_pp)
+            if not args.no_ocr_preprocess else None
+        )
+
+        paddle_raw = paddle_pp = None
+        if paddle is not None:
+            for label, img in (
+                ('raw', up),
+                ('preprocessed', up_pp),
+            ):
+                if label == 'preprocessed' and args.no_ocr_preprocess:
+                    continue
+                praw = paddle.readtext_raw(img)
+                preads = paddle.read_digits(img)
+                print(f'    [paddle {label}] {len(praw)} box(es) reads={preads!r}')
+                for _bbox, text, conf in praw:
+                    print(f'      text={text!r} conf={round(float(conf), 4)}')
+                block = {
+                    'boxes': serialize_det_boxes(praw),
+                    'read_digits': [
+                        {'number': n, 'confidence': c, 'raw_digits': raw}
+                        for n, c, raw in preads
+                    ],
+                }
+                if label == 'raw':
+                    paddle_raw = block
+                else:
+                    paddle_pp = block
+
         samples_out.append({
             **crop_info,
-            'easyocr_modes': modes,
-            'allowlist_pre_merge': serialize_easyocr_boxes(raw_allow),
-            'no_allowlist_pre_merge': serialize_easyocr_boxes(raw_free),
-            'merged_allowlist': [{'digits': t, 'confidence': c} for t, c in merged_allow],
-            'merged_glyph_mapped': [{'digits': t, 'confidence': c} for t, c in merged_map],
-            'read_digits': [
-                {'number': n, 'confidence': c, 'raw_digits': raw}
-                for n, c, raw in reads
-            ],
+            'crop_files': {
+                'upscaled': str(crops_dir / f'{tag}_up.jpg'),
+                'preprocessed': (
+                    str(crops_dir / f'{tag}_pre.jpg')
+                    if not args.no_ocr_preprocess else None
+                ),
+            },
+            'easyocr_raw': easy_raw,
+            'easyocr_preprocessed': easy_pp,
+            'paddle_raw': paddle_raw,
+            'paddle_preprocessed': paddle_pp,
         })
 
     out_path = out_dir / f'debug_fragment_{fragment_id}.json'
@@ -452,8 +538,11 @@ def run_fragment_ocr_debug(
         json.dumps(json_safe({
             'fragment_id': fragment_id,
             'crop_settings': {
+                'xy_is_box_centre': True,
+                'torso_y_above_h': TORSO_Y_ABOVE,
+                'torso_y_below_h': TORSO_Y_BELOW,
+                'torso_x_half_h': TORSO_X_HALF,
                 'torso_width_margin': args.torso_width_margin,
-                'width_frac': args.width_frac,
                 'upscale': args.upscale,
             },
             'samples': samples_out,
@@ -928,10 +1017,9 @@ def main() -> None:
     ap.add_argument('--upscale', type=float, default=2.5,
                     help='Torso crop upscale (2–3 typical)')
     ap.add_argument('--width-frac', type=float, default=0.45,
-                    help='Estimated box width as fraction of height')
-    ap.add_argument('--torso-width-margin', type=float, default=0.10,
-                    help='Fraction trimmed from each side of box width for torso '
-                         'crop (0.10 = middle 80%%)')
+                    help=argparse.SUPPRESS)
+    ap.add_argument('--torso-width-margin', type=float, default=0.0,
+                    help='Optional extra horizontal inset on centre torso crop')
     ap.add_argument('--replay-report', type=Path, default=None,
                     help='Re-probe the same fragment ids as a prior '
                          'jersey_ocr_report.json; contact sheet keeps that order')
@@ -941,12 +1029,14 @@ def main() -> None:
                     help='Print/write pre-merge EasyOCR boxes for this fragment id')
     ap.add_argument('--debug-only', action='store_true',
                     help='With --debug-fragment, run debug then exit (no full probe)')
+    ap.add_argument('--export-crops-only', action='store_true',
+                    help='With --debug-fragment: write upscaled crop JPGs only (no OCR)')
     ap.add_argument('--no-ocr-paragraph', action='store_true',
                     help='EasyOCR paragraph=False only (skip paragraph=True pass)')
-    ap.add_argument('--skip-ocr-no-allowlist', action='store_true',
-                    help='Skip no-allowlist OCR pass (glyph mapping for 0->ll etc.)')
-    ap.add_argument('--ocr-no-allowlist-pass', action='store_true',
-                    help=argparse.SUPPRESS)
+    ap.add_argument('--no-ocr-preprocess', action='store_true',
+                    help='Skip CLAHE + sharpen before OCR (debug compares raw vs pre)')
+    ap.add_argument('--no-paddle-debug', action='store_true',
+                    help='With --debug-fragment, skip PaddleOCR comparison')
     ap.add_argument('--cpu', action='store_true',
                     help='EasyOCR on CPU (default: GPU)')
     ap.add_argument('--contact-n', type=int, default=40)
@@ -1022,9 +1112,9 @@ def main() -> None:
         print(f'  Clip frame range: {cmin}..{cmax} '
               f'(video absolute {cmin + start_frame}..{cmax + start_frame}, '
               f'dump start_frame={start_frame})')
-    mid_pct = (1.0 - 2.0 * args.torso_width_margin) * 100.0
-    print(f'Crop: width_frac={args.width_frac} torso_width_margin={args.torso_width_margin} '
-          f'(torso middle {mid_pct:.0f}% of width) upscale={args.upscale}')
+    print(f'Crop: centre torso y±[{TORSO_Y_ABOVE},{TORSO_Y_BELOW}]h x±{TORSO_X_HALF}h, '
+          f'margin={args.torso_width_margin}, upscale={args.upscale}')
+    print('  Tip: --export-crops-only --debug-fragment N to verify shirts before OCR.')
 
     if args.eligible_only:
         out = args.out_dir / 'jersey_ocr_eligible_summary.json'
@@ -1049,14 +1139,6 @@ def main() -> None:
         args.video, start_frame, needed_frames)
 
     track_by_id = {int(tr['id']): tr for tr in iter_dump_tracks(dump)}
-    include_no_allowlist = not args.skip_ocr_no_allowlist
-    if args.ocr_no_allowlist_pass:
-        include_no_allowlist = True
-    ocr = OcrEngine(
-        gpu=not args.cpu,
-        paragraph=not args.no_ocr_paragraph,
-        include_no_allowlist=include_no_allowlist,
-    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.debug_fragment is not None:
@@ -1065,11 +1147,32 @@ def main() -> None:
         if meta is None:
             raise SystemExit(f'Fragment {fid} not in eligible set '
                              f'(use --only-fragments {fid} if filtered out)')
+        if args.export_crops_only:
+            export_fragment_crops(
+                fid, meta, track_by_id[fid], frame_cache, args, args.out_dir)
+            return
+        ocr = OcrEngine(
+            gpu=not args.cpu,
+            paragraph=not args.no_ocr_paragraph,
+        )
+        paddle_dbg: PaddleOcrEngine | None = None
+        if not args.no_paddle_debug:
+            try:
+                paddle_dbg = PaddleOcrEngine(gpu=not args.cpu)
+                print('PaddleOCR: loaded for debug comparison')
+            except Exception as exc:
+                print(f'PaddleOCR not available ({exc}) — '
+                      f'install paddlepaddle-gpu paddleocr to compare')
         run_fragment_ocr_debug(
-            fid, meta, track_by_id[fid], frame_cache, ocr, args, args.out_dir)
+            fid, meta, track_by_id[fid], frame_cache, ocr, args, args.out_dir,
+            paddle=paddle_dbg)
         if args.debug_only:
             return
 
+    ocr = OcrEngine(
+        gpu=not args.cpu,
+        paragraph=not args.no_ocr_paragraph,
+    )
     results = []
 
     for fi, meta in enumerate(eligible):
@@ -1091,11 +1194,12 @@ def main() -> None:
             if frame is None:
                 continue
             cx, cy, h = sample_centre_and_height(tr, si, hs)
-            x1, y1, x2, y2 = box_from_centre_h(cx, cy, h, args.width_frac)
-            crop = torso_crop(
-                frame, x1, y1, x2, y2, width_margin=args.torso_width_margin)
+            crop, _box = centre_torso_crop(
+                frame, cx, cy, h, width_margin=args.torso_width_margin)
             up = upscale(crop, args.upscale)
-            reads = ocr.read_digits(up)
+            ocr_in = (
+                preprocess_for_ocr(up) if not args.no_ocr_preprocess else up)
+            reads = ocr.read_digits(ocr_in)
             for num, conf, _raw in reads:
                 all_reads.append((num, conf))
             per_sample.append({
@@ -1172,10 +1276,11 @@ def main() -> None:
         'video': str(args.video),
         'params': json_safe(vars(args)),
         'crop_settings': {
-            'width_frac': args.width_frac,
+            'xy_is_box_centre': True,
+            'torso_y_above_h': TORSO_Y_ABOVE,
+            'torso_y_below_h': TORSO_Y_BELOW,
+            'torso_x_half_h': TORSO_X_HALF,
             'torso_width_margin': args.torso_width_margin,
-            'torso_middle_width_pct': round(
-                (1.0 - 2.0 * args.torso_width_margin) * 100.0, 1),
             'upscale': args.upscale,
         },
         'height_diagnostics': height_diag,
