@@ -244,6 +244,18 @@ def dedupe_raw_boxes(
     return out
 
 
+def require_easyocr() -> None:
+    try:
+        import easyocr  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            'easyocr is not installed in this Python environment.\n'
+            '  Main RunPod env: pip install easyocr  (after numpy/opencv repair)\n'
+            '  Or in venv: pip install easyocr  (needs ~2GB+ disk for torch)\n'
+            'See HANDOVER.md — do not install full Paddle stack if disk is full.'
+        ) from exc
+
+
 class OcrEngine:
     def __init__(
             self,
@@ -257,6 +269,7 @@ class OcrEngine:
     def _lazy_init(self):
         if self._reader is not None:
             return
+        require_easyocr()
         import easyocr
         self._reader = easyocr.Reader(['en'], gpu=self._gpu, verbose=False)
 
@@ -617,17 +630,24 @@ def run_fragment_ocr_debug(
         if args.ocr_preprocess or debug_dual:
             cv2.imwrite(str(crops_dir / f'{tag}_pre.jpg'), up_pp)
 
+        slim = getattr(args, 'compare_engines', False)
+
         def _easy_report(label: str, img: np.ndarray) -> dict:
-            modes = ocr.debug_all_modes(img)
             raw_allow = ocr._raw_allowlist(img)
             merged = merge_split_digit_boxes(raw_allow)
             reads = ocr.read_digits(img)
             print(f'\n  frame {fnum} [{label}] {crop_info["upscaled_px"]}')
-            for mode_name, boxes in modes.items():
-                print(f'    [easyocr {mode_name}] {len(boxes)} box(es)')
-                for b in boxes:
-                    print(f"      text={b['text']!r} conf={b['confidence']} "
-                          f"x=[{b['xmin']},{b['xmax']}]")
+            if not slim:
+                modes = ocr.debug_all_modes(img)
+                for mode_name, boxes in modes.items():
+                    print(f'    [easyocr {mode_name}] {len(boxes)} box(es)')
+                    for b in boxes:
+                        print(f"      text={b['text']!r} conf={b['confidence']} "
+                              f"x=[{b['xmin']},{b['xmax']}]")
+            else:
+                modes = {}
+                for _bbox, text, conf in raw_allow:
+                    print(f'      easyocr box text={text!r} conf={round(float(conf), 4)}')
             print(f'    [easyocr allowlist merge] {merged!r} read_digits={reads!r}')
             return {
                 'easyocr_modes': modes,
@@ -1527,6 +1547,12 @@ def main() -> None:
 
     frame_cache = read_video_frames_sequential(
         args.video, start_frame, needed_frames)
+    if needed_frames:
+        got = len(needed_frames & set(frame_cache.keys()))
+        print(f'Decoded {got}/{len(needed_frames)} target frame(s) for probe')
+        if got < len(needed_frames):
+            miss = sorted(needed_frames - set(frame_cache.keys()))[:12]
+            print(f'  WARNING: missing clip frame(s): {miss}...')
 
     if args.debug_fragment is not None:
         fid = int(args.debug_fragment)
@@ -1538,6 +1564,7 @@ def main() -> None:
             export_fragment_crops(
                 fid, meta, track_by_id[fid], frame_cache, args, args.out_dir)
             return
+        require_easyocr()
         ocr = OcrEngine(
             gpu=not args.cpu,
             paragraph=not args.no_ocr_paragraph,
@@ -1547,11 +1574,12 @@ def main() -> None:
         if want_paddle:
             try:
                 paddle_dbg = PaddleOcrEngine(gpu=not args.cpu)
-                print('PaddleOCR: loaded for debug comparison')
+                paddle_dbg._lazy_init()
             except Exception as exc:
                 if args.compare_engines:
                     raise SystemExit(
-                        f'--compare-engines requires PaddleOCR: {exc}')
+                        f'--compare-engines requires PaddleOCR: {exc}\n'
+                        + _paddle_install_hint()) from exc
                 print(f'PaddleOCR not available ({exc}) — '
                       f'install paddlepaddle-gpu paddleocr to compare')
         run_fragment_ocr_debug(

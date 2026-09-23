@@ -512,8 +512,20 @@ pip install --force-reinstall "numpy==1.26.4" \
 python -c "import cv2, numpy; print('ok', numpy.__version__, cv2.__version__)"
 ```
 
+**Disk quota exceeded?** Paddle + EasyOCR need several GB. Before any venv:
+
+```bash
+pip cache purge
+du -sh /workspace/* /root/.cache/pip 2>/dev/null | sort -h
+rm -rf /workspace/venv_jersey_paddle   # drop failed partial venvs
+```
+
+If Paddle cannot install, you can still run EasyOCR debug on frag 178 from the
+**main** env (after numpy/opencv repair) with `--no-paddle-debug --debug-only`.
+That answers “does EasyOCR read 10 on the fixed crop?” without Paddle.
+
 **Paddle compare only — use a separate venv** (do not pip install Paddle into
-the tracking env again):
+the tracking env again; needs free disk):
 
 ```bash
 python3.11 -m venv /workspace/venv_jersey_paddle
