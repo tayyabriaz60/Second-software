@@ -153,10 +153,49 @@ def merge_split_digit_boxes(
     return merged
 
 
+def serialize_easyocr_boxes(
+        raw: list[tuple[list, str, float]]) -> list[dict]:
+    out = []
+    for bbox, text, conf in raw:
+        xs = [float(p[0]) for p in bbox]
+        ys = [float(p[1]) for p in bbox]
+        out.append({
+            'text': text,
+            'confidence': round(float(conf), 4),
+            'bbox': [[round(x, 1), round(y, 1)] for x, y in bbox],
+            'xmin': round(min(xs), 1),
+            'xmax': round(max(xs), 1),
+            'cy': round(sum(ys) / len(ys), 1),
+        })
+    return out
+
+
+def dedupe_raw_boxes(
+        raw: list[tuple[list, str, float]]) -> list[tuple[list, str, float]]:
+    seen: set[tuple] = set()
+    out = []
+    for bbox, text, conf in raw:
+        xs = tuple(round(float(p[0])) for p in bbox)
+        ys = tuple(round(float(p[1])) for p in bbox)
+        key = (text, xs, ys)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((bbox, text, conf))
+    return out
+
+
 class OcrEngine:
-    def __init__(self, gpu: bool):
+    def __init__(
+            self,
+            gpu: bool,
+            paragraph: bool = True,
+            include_no_allowlist: bool = False,
+    ):
         self._reader = None
         self._gpu = gpu
+        self.paragraph = paragraph
+        self.include_no_allowlist = include_no_allowlist
 
     def _lazy_init(self):
         if self._reader is not None:
@@ -164,14 +203,43 @@ class OcrEngine:
         import easyocr
         self._reader = easyocr.Reader(['en'], gpu=self._gpu, verbose=False)
 
-    def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float, str]]:
-        """Returns (jersey number, confidence, raw merged digit string)."""
+    def readtext_raw(
+            self,
+            bgr: np.ndarray,
+            *,
+            paragraph: bool,
+            allowlist: str | None,
+    ) -> list[tuple[list, str, float]]:
         self._lazy_init()
         if bgr.size == 0:
             return []
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        raw = self._reader.readtext(
-            rgb, allowlist='0123456789', paragraph=False, detail=1)
+        kw: dict = dict(paragraph=paragraph, detail=1)
+        if allowlist is not None:
+            kw['allowlist'] = allowlist
+        return self._reader.readtext(rgb, **kw)
+
+    def collect_raw_for_merge(
+            self, bgr: np.ndarray, *, include_no_allowlist: bool = False,
+    ) -> list[tuple[list, str, float]]:
+        """Allowlist reads (paragraph False + optional True); dedupe before merge."""
+        combined: list[tuple[list, str, float]] = []
+        combined.extend(
+            self.readtext_raw(bgr, paragraph=False, allowlist='0123456789'))
+        if self.paragraph:
+            combined.extend(
+                self.readtext_raw(bgr, paragraph=True, allowlist='0123456789'))
+        if include_no_allowlist:
+            combined.extend(
+                self.readtext_raw(bgr, paragraph=True, allowlist=None))
+        return dedupe_raw_boxes(combined)
+
+    def read_digits(self, bgr: np.ndarray) -> list[tuple[int, float, str]]:
+        """Returns (jersey number, confidence, raw merged digit string)."""
+        if bgr.size == 0:
+            return []
+        raw = self.collect_raw_for_merge(
+            bgr, include_no_allowlist=self.include_no_allowlist)
         out: list[tuple[int, float, str]] = []
         seen: set[tuple[int, float]] = set()
         for merged_text, conf in merge_split_digit_boxes(raw):
@@ -184,6 +252,92 @@ class OcrEngine:
             seen.add(key)
             out.append((num, float(conf), merged_text))
         return out
+
+    def debug_all_modes(self, bgr: np.ndarray) -> dict[str, list[dict]]:
+        modes = {
+            'paragraph_false_allowlist': (False, '0123456789'),
+            'paragraph_true_allowlist': (True, '0123456789'),
+            'paragraph_false_no_allowlist': (False, None),
+            'paragraph_true_no_allowlist': (True, None),
+        }
+        report = {}
+        for name, (para, allow) in modes.items():
+            raw = self.readtext_raw(bgr, paragraph=para, allowlist=allow)
+            report[name] = serialize_easyocr_boxes(raw)
+        return report
+
+
+def run_fragment_ocr_debug(
+        fragment_id: int,
+        meta: dict,
+        tr: dict,
+        frame_cache: dict[int, np.ndarray],
+        ocr: OcrEngine,
+        args,
+        out_dir: Path,
+) -> None:
+    """Print and write pre-merge EasyOCR boxes for one fragment."""
+    frames = meta['frames']
+    hs = meta['heights']
+    samples_out = []
+    print(f'\n=== OCR debug fragment {fragment_id} ===')
+    print(f'  torso_width_margin={args.torso_width_margin} '
+          f'(middle {(1 - 2 * args.torso_width_margin) * 100:.0f}% of est. box width)')
+    print(f'  width_frac={args.width_frac} upscale={args.upscale}')
+
+    for si in meta['sample_idx']:
+        fnum = int(frames[si])
+        frame = frame_cache.get(fnum)
+        if frame is None:
+            continue
+        cx, cy, h = sample_centre_and_height(tr, si, hs)
+        x1, y1, x2, y2 = box_from_centre_h(cx, cy, h, args.width_frac)
+        crop = torso_crop(
+            frame, x1, y1, x2, y2, width_margin=args.torso_width_margin)
+        up = upscale(crop, args.upscale)
+        crop_info = {
+            'frame': fnum,
+            'box_xyxy': [x1, y1, x2, y2],
+            'torso_px': [int(crop.shape[1]), int(crop.shape[0])],
+            'upscaled_px': [int(up.shape[1]), int(up.shape[0])],
+            'width_margin': args.torso_width_margin,
+        }
+        modes = ocr.debug_all_modes(up)
+        print(f'\n  frame {fnum} crop {crop_info["torso_px"]} -> up {crop_info["upscaled_px"]}')
+        for mode_name, boxes in modes.items():
+            print(f'    [{mode_name}] {len(boxes)} box(es)')
+            for b in boxes:
+                print(f"      text={b['text']!r} conf={b['confidence']} "
+                      f"x=[{b['xmin']},{b['xmax']}]")
+        raw_combined = ocr.collect_raw_for_merge(up, include_no_allowlist=True)
+        print(f'    [combined pre-merge] {len(raw_combined)} box(es)')
+        for _bbox, text, conf in raw_combined:
+            print(f'      text={text!r} conf={round(float(conf), 4)}')
+        merged = merge_split_digit_boxes(raw_combined)
+        print(f'    [after merge] {merged!r}')
+
+        tag = f'frag{fragment_id}_f{fnum}'
+        cv2.imwrite(str(out_dir / f'debug_{tag}_up.jpg'), up)
+        samples_out.append({
+            **crop_info,
+            'easyocr_modes': modes,
+            'combined_pre_merge': serialize_easyocr_boxes(raw_combined),
+            'merged': [{'digits': t, 'confidence': c} for t, c in merged],
+        })
+
+    out_path = out_dir / f'debug_fragment_{fragment_id}.json'
+    out_path.write_text(
+        json.dumps(json_safe({
+            'fragment_id': fragment_id,
+            'crop_settings': {
+                'torso_width_margin': args.torso_width_margin,
+                'width_frac': args.width_frac,
+                'upscale': args.upscale,
+            },
+            'samples': samples_out,
+        }), indent=2),
+        encoding='utf-8')
+    print(f'\n  Wrote {out_path}')
 
 
 def majority_stats(reads: list[tuple[int, float]]) -> tuple[int | None, int, float]:
@@ -645,6 +799,16 @@ def main() -> None:
     ap.add_argument('--replay-report', type=Path, default=None,
                     help='Re-probe the same fragment ids as a prior '
                          'jersey_ocr_report.json; contact sheet keeps that order')
+    ap.add_argument('--only-fragments', type=str, default=None,
+                    help='Comma-separated fragment ids to probe')
+    ap.add_argument('--debug-fragment', type=int, default=None,
+                    help='Print/write pre-merge EasyOCR boxes for this fragment id')
+    ap.add_argument('--debug-only', action='store_true',
+                    help='With --debug-fragment, run debug then exit (no full probe)')
+    ap.add_argument('--no-ocr-paragraph', action='store_true',
+                    help='EasyOCR paragraph=False only (skip paragraph=True pass)')
+    ap.add_argument('--ocr-no-allowlist-pass', action='store_true',
+                    help='Also run paragraph=True without digit allowlist (noisy)')
     ap.add_argument('--cpu', action='store_true',
                     help='EasyOCR on CPU (default: GPU)')
     ap.add_argument('--contact-n', type=int, default=40)
@@ -673,6 +837,10 @@ def main() -> None:
 
     n_eligible_total = len(eligible)
     replay_ids: list[int] | None = None
+    if args.only_fragments:
+        want_only = {int(x.strip()) for x in args.only_fragments.split(',') if x.strip()}
+        eligible = [e for e in eligible if int(e['id']) in want_only]
+
     if args.replay_report:
         prior = json.loads(args.replay_report.read_text(encoding='utf-8'))
         replay_ids = [int(f['fragment_id']) for f in prior.get('fragments', [])]
@@ -711,6 +879,9 @@ def main() -> None:
         print('  WARNING: 0 eligible — check dump has h/box_height_px/xyxy or '
               'centre-y with measured heights on other tracks.')
     print(f'Unique frames to decode: {len(needed_frames)}')
+    mid_pct = (1.0 - 2.0 * args.torso_width_margin) * 100.0
+    print(f'Crop: width_frac={args.width_frac} torso_width_margin={args.torso_width_margin} '
+          f'(torso middle {mid_pct:.0f}% of width) upscale={args.upscale}')
 
     if args.eligible_only:
         out = args.out_dir / 'jersey_ocr_eligible_summary.json'
@@ -735,7 +906,24 @@ def main() -> None:
         args.video, start_frame, needed_frames)
 
     track_by_id = {int(tr['id']): tr for tr in iter_dump_tracks(dump)}
-    ocr = OcrEngine(gpu=not args.cpu)
+    ocr = OcrEngine(
+        gpu=not args.cpu,
+        paragraph=not args.no_ocr_paragraph,
+        include_no_allowlist=args.ocr_no_allowlist_pass,
+    )
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.debug_fragment is not None:
+        fid = int(args.debug_fragment)
+        meta = next((e for e in eligible if int(e['id']) == fid), None)
+        if meta is None:
+            raise SystemExit(f'Fragment {fid} not in eligible set '
+                             f'(use --only-fragments {fid} if filtered out)')
+        run_fragment_ocr_debug(
+            fid, meta, track_by_id[fid], frame_cache, ocr, args, args.out_dir)
+        if args.debug_only:
+            return
+
     results = []
 
     for fi, meta in enumerate(eligible):
@@ -837,6 +1025,13 @@ def main() -> None:
         'dump': str(args.dump),
         'video': str(args.video),
         'params': json_safe(vars(args)),
+        'crop_settings': {
+            'width_frac': args.width_frac,
+            'torso_width_margin': args.torso_width_margin,
+            'torso_middle_width_pct': round(
+                (1.0 - 2.0 * args.torso_width_margin) * 100.0, 1),
+            'upscale': args.upscale,
+        },
         'height_diagnostics': height_diag,
         'summary': {
             'fragments_probed': n_probed,
