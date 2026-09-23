@@ -98,6 +98,23 @@ def upscale(crop: np.ndarray, scale: float) -> np.ndarray:
     return cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_CUBIC)
 
 
+def normalize_readtext_row(row) -> tuple[list, str, float]:
+    """EasyOCR detail=1: (bbox, text, conf); paragraph=True omits confidence."""
+    n = len(row)
+    if n == 2:
+        bbox, text = row
+        return bbox, text, 1.0
+    if n == 3:
+        bbox, text, conf = row
+        return bbox, text, float(conf)
+    raise ValueError(f'Unexpected EasyOCR row length {n}: {row!r}')
+
+
+def normalize_readtext_rows(
+        rows: list) -> list[tuple[list, str, float]]:
+    return [normalize_readtext_row(r) for r in rows]
+
+
 def parse_jersey_number(text: str) -> int | None:
     digits = re.sub(r'\D', '', text or '')
     if not digits:
@@ -217,7 +234,7 @@ class OcrEngine:
         kw: dict = dict(paragraph=paragraph, detail=1)
         if allowlist is not None:
             kw['allowlist'] = allowlist
-        return self._reader.readtext(rgb, **kw)
+        return normalize_readtext_rows(self._reader.readtext(rgb, **kw))
 
     def collect_raw_for_merge(
             self, bgr: np.ndarray, *, include_no_allowlist: bool = False,
@@ -690,14 +707,20 @@ def read_video_frames_sequential(
     start_frame: int,
     needed: set[int],
 ) -> dict[int, np.ndarray]:
-    """Forward-only decode — no cap.set(CAP_PROP_POS_FRAMES)."""
+    """Forward-only decode — no cap.set(CAP_PROP_POS_FRAMES).
+
+    ``needed`` uses clip-relative indices from the track dump (pass-1
+    ``frame_n``). Absolute video indices are ``clip + start_frame``.
+    """
     if not needed:
         return {}
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise SystemExit(f'Cannot open video: {video_path}')
 
-    max_f = max(needed)
+    needed_clip = {int(f) for f in needed}
+    needed_abs = {f + int(start_frame) for f in needed_clip}
+    max_abs = max(needed_abs)
     out: dict[int, np.ndarray] = {}
     frame_idx = 0
     try:
@@ -706,25 +729,29 @@ def read_video_frames_sequential(
                 return out
             frame_idx += 1
 
-        log_every = max(500, (max_f - start_frame) // 20)
-        while frame_idx <= max_f:
+        span = max(1, max_abs - frame_idx)
+        log_every = max(500, span // 20)
+        while frame_idx <= max_abs:
             ok, frame = cap.read()
             if not ok:
                 break
-            if frame_idx in needed:
-                out[frame_idx] = frame
-                if len(out) == len(needed):
+            if frame_idx in needed_abs:
+                clip_idx = frame_idx - int(start_frame)
+                out[clip_idx] = frame
+                if len(out) == len(needed_clip):
                     break
             if log_every and frame_idx % log_every == 0:
-                print(f'  decode: frame {frame_idx}/{max_f}, '
-                      f'have {len(out)}/{len(needed)} targets', flush=True)
+                print(f'  decode: video frame {frame_idx}/{max_abs} '
+                      f'(clip ~{frame_idx - int(start_frame)}), '
+                      f'have {len(out)}/{len(needed_clip)} targets', flush=True)
             frame_idx += 1
     finally:
         cap.release()
 
-    missing = needed - set(out.keys())
+    missing = needed_clip - set(out.keys())
     if missing:
-        print(f'  WARNING: {len(missing)} frames not read (eof or short video)')
+        print(f'  WARNING: {len(missing)} clip frame(s) not read '
+              f'(eof or short video); sample missing: {sorted(missing)[:8]}')
     return out
 
 
@@ -879,6 +906,11 @@ def main() -> None:
         print('  WARNING: 0 eligible — check dump has h/box_height_px/xyxy or '
               'centre-y with measured heights on other tracks.')
     print(f'Unique frames to decode: {len(needed_frames)}')
+    if needed_frames:
+        cmin, cmax = min(needed_frames), max(needed_frames)
+        print(f'  Clip frame range: {cmin}..{cmax} '
+              f'(video absolute {cmin + start_frame}..{cmax + start_frame}, '
+              f'dump start_frame={start_frame})')
     mid_pct = (1.0 - 2.0 * args.torso_width_margin) * 100.0
     print(f'Crop: width_frac={args.width_frac} torso_width_margin={args.torso_width_margin} '
           f'(torso middle {mid_pct:.0f}% of width) upscale={args.upscale}')
