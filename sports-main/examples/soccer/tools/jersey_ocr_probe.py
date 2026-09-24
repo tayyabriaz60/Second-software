@@ -1290,7 +1290,8 @@ def _engine_compare_one(
     print(f'\n=== Engine compare fragment {fragment_id} — {label} ===')
     print(f'{"frame":>8}  {"easy":>6}  {"paddle":>6}  easy reads          paddle reads')
     rows = []
-    n_paddle_10 = n_easy_10 = 0
+    n_paddle_10 = n_easy_10 = n_easy_1 = 0
+    n_paddle_10_when_easy_1 = 0
     n_paddle_any = 0
     for s in samples:
         fnum = s['frame']
@@ -1304,8 +1305,12 @@ def _engine_compare_one(
             n_paddle_any += 1
         if en == 10:
             n_easy_10 += 1
+        if en == 1:
+            n_easy_1 += 1
         if pn == 10:
             n_paddle_10 += 1
+        if en == 1 and pn == 10:
+            n_paddle_10_when_easy_1 += 1
         es = en if en is not None else '—'
         ps = pn if pn is not None else '—'
         er = [(r['number'], r['confidence'], r.get('raw_digits', '')) for r in easy_r]
@@ -1314,13 +1319,16 @@ def _engine_compare_one(
               f'{_reads_summary(pr) if pad_r else "—"}')
         rows.append({'frame': fnum, 'easy': en, 'paddle': pn})
     print(f'  Frames with paddle read: {n_paddle_any}/{len(samples)}')
-    print(f'  EasyOCR read 10 on {n_easy_10} frame(s); Paddle read 10 on {n_paddle_10} frame(s)')
+    print(f'  EasyOCR: 10 on {n_easy_10} frame(s), 1 on {n_easy_1}; '
+          f'Paddle: 10 on {n_paddle_10} ({n_paddle_10_when_easy_1} where Easy=1)')
     return {
         'crop_variant': label,
         'fragment_id': fragment_id,
         'rows': rows,
         'easy_frames_with_10': n_easy_10,
+        'easy_frames_with_1': n_easy_1,
         'paddle_frames_with_10': n_paddle_10,
+        'paddle_10_when_easy_1': n_paddle_10_when_easy_1,
         'paddle_frames_with_any_read': n_paddle_any,
     }
 
@@ -1328,9 +1336,17 @@ def _engine_compare_one(
 def _verdict_from_compare(cmp: dict) -> str:
     n_easy_10 = cmp['easy_frames_with_10']
     n_paddle_10 = cmp['paddle_frames_with_10']
-    if n_paddle_10 > n_easy_10:
+    n_easy_1 = cmp.get('easy_frames_with_1', 0)
+    n_fix = cmp.get('paddle_10_when_easy_1', 0)
+    if n_fix >= 3 and n_fix / max(n_easy_1, 1) >= 0.60:
+        return ('Paddle reads 10 where EasyOCR reads 1 — re-run probe with '
+                '--ocr-engine paddle.')
+    if n_paddle_10 > max(n_easy_10, 0) and n_paddle_10 >= 3:
         return ('Paddle reads 10 more often — try --ocr-engine paddle and re-run probe.')
     if n_paddle_10 == 0 and n_easy_10 == 0:
+        if n_easy_1 >= 3:
+            return ('EasyOCR reads 1 on shirt-10 crops; Paddle also misses 10 — '
+                    'off-the-shelf OCR drops trailing zeros; train a digit model.')
         return ('Neither engine read 10 — off-the-shelf OCR likely insufficient; '
                 'train a digit model on these crops.')
     return 'Paddle did not beat EasyOCR on digit 10 — same resolution limit.'
@@ -1366,6 +1382,148 @@ def make_probe_ocr(args) -> OcrEngine | PaddleOcrEngine:
         gpu=gpu,
         paragraph=not args.no_ocr_paragraph,
     )
+
+
+def _frame_id_from_crop_path(path: Path) -> int:
+    m = re.search(r'_f(\d+)_', path.name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)', path.stem)
+    return int(m.group(1)) if m else 0
+
+
+def _ocr_sample_on_crop(
+        up: np.ndarray,
+        up_pp: np.ndarray,
+        fnum: int,
+        ocr: OcrEngine,
+        paddle: PaddleOcrEngine,
+        *,
+        debug_dual: bool,
+        slim: bool,
+) -> dict:
+    """One frame: EasyOCR + Paddle on raw (and optional preprocessed) crops."""
+
+    def _easy_block(label: str, img: np.ndarray) -> dict:
+        raw_allow = ocr._raw_allowlist(img)
+        merged = merge_split_digit_boxes(raw_allow)
+        reads = ocr.read_digits(img)
+        print(f'\n  frame {fnum} [{label}] {list(img.shape[1::-1])}')
+        if not slim:
+            modes = ocr.debug_all_modes(img)
+            for mode_name, boxes in modes.items():
+                print(f'    [easyocr {mode_name}] {len(boxes)} box(es)')
+        else:
+            modes = {}
+            for _bbox, text, conf in raw_allow:
+                print(f'      easyocr box text={text!r} conf={round(float(conf), 4)}')
+        print(f'    [easyocr allowlist merge] {merged!r} read_digits={reads!r}')
+        return {
+            'easyocr_modes': modes if not slim else {},
+            'allowlist_pre_merge': serialize_det_boxes(raw_allow),
+            'merged_allowlist': [{'digits': t, 'confidence': c} for t, c in merged],
+            'read_digits': [
+                {'number': n, 'confidence': c, 'raw_digits': raw}
+                for n, c, raw in reads
+            ],
+        }
+
+    easy_raw = _easy_block('raw upscale', up)
+    easy_pp = _easy_block('preprocessed', up_pp) if debug_dual else None
+
+    paddle_raw = paddle_pp = None
+    for label, img in (('raw', up), ('preprocessed', up_pp)):
+        if label == 'preprocessed' and not debug_dual:
+            continue
+        praw = paddle.readtext_raw(img)
+        preads = paddle.read_digits(img)
+        print(f'    [paddle {label}] {len(praw)} box(es) reads={preads!r}')
+        for _bbox, text, conf in praw:
+            print(f'      text={text!r} conf={round(float(conf), 4)}')
+        block = {
+            'boxes': serialize_det_boxes(praw),
+            'read_digits': [
+                {'number': n, 'confidence': c, 'raw_digits': raw}
+                for n, c, raw in preads
+            ],
+        }
+        if label == 'raw':
+            paddle_raw = block
+        else:
+            paddle_pp = block
+
+    return {
+        'frame': fnum,
+        'upscaled_px': [int(up.shape[1]), int(up.shape[0])],
+        'easyocr_raw': easy_raw,
+        'easyocr_preprocessed': easy_pp,
+        'paddle_raw': paddle_raw,
+        'paddle_preprocessed': paddle_pp,
+    }
+
+
+def compare_engines_on_crop_dir(args) -> None:
+    """EasyOCR vs Paddle on saved upscaled torso JPGs (no video / dump decode)."""
+    crop_dir = args.compare_crops_dir
+    if not crop_dir.is_dir():
+        raise SystemExit(f'Not a directory: {crop_dir}')
+    paths = sorted(crop_dir.glob('*_up.jpg'))
+    if not paths:
+        paths = sorted(crop_dir.glob('*.jpg'))
+    if not paths:
+        raise SystemExit(f'No JPG crops in {crop_dir}')
+
+    fid = int(args.debug_fragment or 0)
+    if fid <= 0:
+        m = re.search(r'frag(\d+)', crop_dir.name, re.I)
+        if m:
+            fid = int(m.group(1))
+    if fid <= 0:
+        m = re.search(r'frag(\d+)', paths[0].name, re.I)
+        fid = int(m.group(1)) if m else 0
+
+    require_easyocr()
+    ocr = OcrEngine(gpu=not args.cpu, paragraph=not args.no_ocr_paragraph)
+    try:
+        paddle = PaddleOcrEngine(gpu=not args.cpu)
+        paddle._lazy_init()
+    except Exception as exc:
+        raise SystemExit(
+            f'--compare-crops-dir requires PaddleOCR: {exc}\n'
+            + _paddle_install_hint()) from exc
+
+    print(f'Engine compare on {len(paths)} crop(s) in {crop_dir}')
+    debug_dual = True
+    slim = True
+    samples_out: list[dict] = []
+    for path in paths:
+        up = cv2.imread(str(path))
+        if up is None or up.size == 0:
+            print(f'  skip unreadable {path.name}')
+            continue
+        fnum = _frame_id_from_crop_path(path)
+        up_pp = preprocess_for_ocr(up)
+        samples_out.append(_ocr_sample_on_crop(
+            up, up_pp, fnum, ocr, paddle,
+            debug_dual=debug_dual, slim=slim))
+
+    if not samples_out:
+        raise SystemExit('No readable crops')
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    tag = fid if fid else 'crops'
+    out_path = args.out_dir / f'debug_fragment_{tag}.json'
+    out_path.write_text(json.dumps(json_safe({
+        'fragment_id': fid,
+        'source': 'compare_crops_dir',
+        'crop_dir': str(crop_dir),
+        'samples': samples_out,
+    }), indent=2), encoding='utf-8')
+    print(f'\n  Wrote {out_path}')
+    cmp = print_engine_compare_table(fid, samples_out, include_preprocessed=debug_dual)
+    cmp_path = args.out_dir / f'engine_compare_frag{tag}.json'
+    cmp_path.write_text(json.dumps(json_safe(cmp), indent=2), encoding='utf-8')
+    print(f'  Wrote {cmp_path}')
 
 
 def thumbs_from_report(
@@ -1489,8 +1647,9 @@ def rebuild_contact_sheet(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--dump', type=Path, required=True,
-                    help='track_dump_*deliver_v2*.json')
+    ap.add_argument('--dump', type=Path, default=None,
+                    help='track_dump_*deliver_v2*.json (not needed with '
+                         '--compare-crops-dir)')
     ap.add_argument('--video', type=Path, default=None,
                     help='Source video (not needed with --eligible-only)')
     ap.add_argument('--eligible-only', action='store_true',
@@ -1526,6 +1685,9 @@ def main() -> None:
                     help='With --debug-fragment, skip PaddleOCR comparison')
     ap.add_argument('--compare-engines', action='store_true',
                     help='With --debug-fragment: require Paddle + print side-by-side table')
+    ap.add_argument('--compare-crops-dir', type=Path, default=None,
+                    help='EasyOCR vs Paddle on saved *_up.jpg crops only (implies '
+                         '--compare-engines; use separate Paddle venv on RunPod)')
     ap.add_argument('--rebuild-contact-sheet', action='store_true',
                     help='Rebuild jersey_ocr_contact_sheet.jpg from existing '
                          'jersey_ocr_report.json + video (no full re-OCR)')
@@ -1543,6 +1705,15 @@ def main() -> None:
     ap.add_argument('--include-referees', action='store_true',
                     help='Do not skip referee-class fragments')
     args = ap.parse_args()
+
+    if args.compare_crops_dir is not None:
+        if not args.compare_engines:
+            args.compare_engines = True
+        compare_engines_on_crop_dir(args)
+        return
+
+    if args.dump is None:
+        raise SystemExit('--dump is required unless using --compare-crops-dir')
 
     if args.feasibility:
         if not args.max_fragments:

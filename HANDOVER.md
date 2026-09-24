@@ -500,8 +500,25 @@ python tools/jersey_ocr_probe.py ... \
 JPGs land in `out-dir/crops_frag178/` (`*_up.jpg`, optional `*_pre.jpg`). If
 the shirt is not in the crop, stop — nothing downstream matters.
 
-Debug with EasyOCR + optional PaddleOCR compare: `--debug-fragment 178
---compare-engines --debug-only` (primary verdict is **raw upscale**, not CLAHE).
+Debug with EasyOCR + PaddleOCR compare (shirt **10** vs Easy **1**):
+
+```bash
+bash tools/run_paddle_compare_frag178.sh
+# or manually in venv_jersey_paddle:
+python tools/jersey_ocr_probe.py ... --only-fragments 178 --debug-fragment 178 \
+  --compare-engines --debug-only
+```
+
+If you already exported good crops (no video re-decode):
+
+```bash
+python tools/jersey_ocr_probe.py --compare-crops-dir data/jersey_ocr_v5/crops_frag178 \
+  --debug-fragment 178 --out-dir data/jersey_ocr_engine178 --compare-engines
+```
+
+Primary verdict is **raw upscale** (not CLAHE). If Paddle reads **10** where Easy
+reads **1**, re-run the full probe with `--ocr-engine paddle`. If both miss **10**,
+tell Sean: single/clear two-digit OK, trailing zero dropped → **digit model**.
 
 ### RunPod: fix cv2/numpy after a bad Paddle pip install
 
