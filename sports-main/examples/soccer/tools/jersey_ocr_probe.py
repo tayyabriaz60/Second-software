@@ -772,19 +772,71 @@ def _infer_imgsz_height(dump: dict) -> float | None:
 
 def _scale_heights_infer_to_video(
         vals: list[float], frame_h: float, dump: dict) -> list[float]:
-    """Heights from 576-tall inference space -> native video height."""
+    """Optional infer-space -> video scaling (off unless dump says so).
+
+    main.py --track_dump writes ``h`` / ``box_height_px`` already in native
+    video pixels. Do not scale those when ``inference_imgsz`` is present in the
+    JSON (that broke crops: doubled h -> legs/netting in the contact sheet).
+    """
     vals = _scale_heights_to_px(vals, frame_h)
     if not vals or frame_h <= 0:
+        return vals
+    if not dump.get('box_heights_in_infer_space'):
         return vals
     ih = _infer_imgsz_height(dump)
     if ih is None or ih <= 0 or ih >= frame_h:
         return vals
-    mx = max(vals)
-    # Native near-touchline boxes often exceed ~250px; infer-space tops out ~140.
-    if mx > 0 and mx < frame_h * 0.22:
-        scale = frame_h / ih
-        return [v * scale for v in vals]
-    return vals
+    scale = frame_h / ih
+    return [v * scale for v in vals]
+
+
+def _pad_height_list(vals: list[float], n: int) -> list[float]:
+    if n <= 0:
+        return []
+    out = list(vals[:n])
+    out.extend([0.0] * max(0, n - len(out)))
+    return out[:n]
+
+
+def explicit_per_frame_heights(
+        tr: dict, n: int, frame_h: float) -> list[float] | None:
+    """Per-frame box heights from dump arrays (main.py ``h``, ``box_height_px``).
+
+    No y-position model and no inference-imgsz heuristic — use the dump values.
+    """
+    if n <= 0:
+        return None
+    for key in _HEIGHT_KEYS:
+        raw = tr.get(key)
+        if raw in (None, ''):
+            continue
+        if isinstance(raw, (int, float)):
+            vals = [float(raw)] * n
+        elif isinstance(raw, list) and raw:
+            vals = []
+            for v in raw:
+                try:
+                    vals.append(float(v) if v not in (None, '') else 0.0)
+                except (TypeError, ValueError):
+                    vals.append(0.0)
+            vals = _pad_height_list(vals, n)
+        else:
+            continue
+        if max(vals, default=0) <= 0:
+            continue
+        return _scale_heights_to_px(vals, frame_h)
+    wh = tr.get('wh')
+    if isinstance(wh, list) and wh:
+        out = []
+        for row in wh[:n]:
+            if row and len(row) >= 2:
+                out.append(float(row[1]))
+            else:
+                out.append(0.0)
+        out = _pad_height_list(out, n)
+        if max(out, default=0) > 0:
+            return _scale_heights_to_px(out, frame_h)
+    return None
 
 
 def _looks_like_cxcywh(p: list) -> bool:
@@ -882,18 +934,15 @@ def _heights_from_list_field(tr: dict, n: int) -> list[float] | None:
 
 def _measured_heights(
         tr: dict, n: int, frame_h: float, dump: dict) -> list[float] | None:
-    candidates: list[list[float]] = []
-    for fn in (_heights_from_list_field, _heights_from_xyxy,
-               _heights_from_record_list):
+    """Geometry / legacy paths when explicit per-frame ``h`` is missing."""
+    for fn in (_heights_from_xyxy, _heights_from_record_list):
         hs = fn(tr, n)
         if hs is None:
             continue
         hs = _scale_heights_infer_to_video(hs, frame_h, dump)
         if max(hs, default=0) > 0:
-            candidates.append(hs)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda h: max(h))
+            return hs
+    return None
 
 
 def referee_class_from_dump(dump: dict) -> int | None:
@@ -927,27 +976,29 @@ def resolve_referee_class_id(dump: dict, cli_override: int | None) -> int:
 def sample_centre_and_height(
         tr: dict, idx: int, hs: list[float]) -> tuple[float, float, float]:
     xy = tr['xy'][idx]
-    h = float(hs[idx]) if idx < len(hs) else 0.0
+    h_dump = float(hs[idx]) if idx < len(hs) else 0.0
     if len(xy) >= 4:
         p = [float(v) for v in xy[:4]]
         if _looks_like_cxcywh(p):
             cx, cy, bh = p[0], p[1], p[3]
-            return cx, cy, bh if bh > 0 else h
+            return cx, cy, h_dump if h_dump > 0 else bh
         x1, y1, x2, y2 = p
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         bh = abs(y2 - y1)
-        return cx, cy, bh if bh > 0 else h
-    return float(xy[0]), float(xy[1]), h
+        return cx, cy, h_dump if h_dump > 0 else bh
+    return float(xy[0]), float(xy[1]), h_dump
 
 
 def fit_y_height_model(tracks: list[dict], frame_h: float, dump: dict):
-    """Linear y -> box height from tracks that already have pixel heights."""
+    """Linear y -> box height (only for tracks with no explicit ``h`` list)."""
     ys, hs = [], []
     for tr in tracks:
         n = len(tr.get('frames') or [])
         if n < 2:
             continue
-        hlist = _measured_heights(tr, n, frame_h, dump)
+        hlist = explicit_per_frame_heights(tr, n, frame_h)
+        if hlist is None:
+            hlist = _measured_heights(tr, n, frame_h, dump)
         if hlist is None:
             continue
         xy = tr.get('xy') or []
@@ -970,6 +1021,9 @@ def per_track_heights(
     n = len(tr.get('frames') or [])
     if n == 0:
         return []
+    hs = explicit_per_frame_heights(tr, n, frame_h)
+    if hs is not None:
+        return hs
     hs = _measured_heights(tr, n, frame_h, dump)
     if hs is not None:
         return hs
@@ -977,6 +1031,18 @@ def per_track_heights(
     if y_model is not None and len(xy) >= n:
         return [float(y_model(float(xy[i][1]))) for i in range(n)]
     return [0.0] * n
+
+
+def track_height_source(
+        tr: dict, frame_h: float, y_model, dump: dict) -> str:
+    n = len(tr.get('frames') or [])
+    if explicit_per_frame_heights(tr, n, frame_h) is not None:
+        return 'dump_h'
+    if _measured_heights(tr, n, frame_h, dump) is not None:
+        return 'geometry'
+    if y_model is not None and len(tr.get('xy') or []) >= n:
+        return 'y_fallback'
+    return 'none'
 
 
 def iter_dump_tracks(dump: dict) -> list[dict]:
@@ -991,7 +1057,14 @@ def dump_height_diagnostics(dump: dict, tracks: list[dict], frame_h: float) -> d
     y_model = fit_y_height_model(tracks, frame_h, dump)
     max_h = 0.0
     n_with = 0
+    n_dump_h = 0
+    n_y_fallback = 0
     for tr in tracks:
+        src = track_height_source(tr, frame_h, y_model, dump)
+        if src == 'dump_h':
+            n_dump_h += 1
+        elif src == 'y_fallback':
+            n_y_fallback += 1
         hs = per_track_heights(tr, frame_h, y_model, dump)
         if hs and max(hs) > 0:
             n_with += 1
@@ -1000,8 +1073,12 @@ def dump_height_diagnostics(dump: dict, tracks: list[dict], frame_h: float) -> d
     return {
         'n_tracks': len(tracks),
         'tracks_with_height': n_with,
+        'tracks_with_dump_h': n_dump_h,
+        'tracks_using_y_height_fallback': n_y_fallback,
         'global_max_height_px': round(max_h, 1),
         'sample_track_keys': sorted(sample.keys()) if sample else [],
+        'y_height_model_fitted': y_model is not None,
+        # Back-compat alias (was misread as “all tracks use y fallback”).
         'used_y_fallback_model': y_model is not None,
         'dump_width': dump.get('width'),
         'dump_height': dump.get('height'),
@@ -1517,12 +1594,18 @@ def main() -> None:
         print(f'  Referee filter: class_id={ref_cls} — skipped {ref_skip} track(s)'
               f' ({ref_skip_ok} would have met height threshold)')
     print(f'  Height diagnostics: {height_diag}')
+    n_fb = int(height_diag.get('tracks_using_y_height_fallback') or 0)
+    n_dh = int(height_diag.get('tracks_with_dump_h') or 0)
+    n_tr = int(height_diag.get('n_tracks') or 0)
+    if n_tr and n_dh < n_tr:
+        print(f'  WARNING: {n_tr - n_dh} track(s) lack per-frame h — using '
+              f'geometry or y fallback ({n_fb} y-fallback). Crops may be wrong.')
     if not eligible and ref_skip_ok and not args.include_referees:
         print('  WARNING: referee filter removed all height-eligible tracks — '
               f'check --referee-class (YOLO panoramic finetune: 2, RF-DETR: 3).')
     elif not eligible:
-        print('  WARNING: 0 eligible — check dump has h/box_height_px/xyxy or '
-              'centre-y with measured heights on other tracks.')
+        print('  WARNING: 0 eligible — check dump has per-frame h/box_height_px '
+              '(main.py --track_dump) or geometry / y fallback on other tracks.')
     print(f'Unique frames to decode: {len(needed_frames)}')
     if needed_frames:
         cmin, cmax = min(needed_frames), max(needed_frames)

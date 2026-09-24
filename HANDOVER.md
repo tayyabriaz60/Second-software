@@ -450,7 +450,13 @@ Two independent bugs made all prior probe numbers **void** (including reported
    `start_frame` in the dump must be added when decoding the file. Fixed in
    `dc7d318`.
 
-2. **Crop geometry (the main one).** Dump `xy` is the **detector box centre**,
+2. **Box height source.** main.py `--track_dump` stores native-pixel `h` per
+   frame. The probe must use that list directly — not a y→height estimate and
+   not infer-space scaling when `inference_imgsz` is in the JSON (that doubled
+   `h` and blew up torso crops to legs/netting). Diagnostics now report
+   `tracks_with_dump_h` and `tracks_using_y_height_fallback`.
+
+3. **Crop geometry (centre band).** Dump `xy` is the **detector box centre**,
    not the feet. The probe built a full box then took 15–60% from the **top** of
    that box — equivalent to a feet-anchored band around `cy − 0.85h … cy − 0.50h`
    when `xy` is read as centre. **Every OCR read was grass** (pitch texture,
