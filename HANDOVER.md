@@ -520,6 +520,25 @@ Primary verdict is **raw upscale** (not CLAHE). If Paddle reads **10** where Eas
 reads **1**, re-run the full probe with `--ocr-engine paddle`. If both miss **10**,
 tell Sean: single/clear two-digit OK, trailing zero dropped → **digit model**.
 
+### Digit classifier dataset (step 1 — export only)
+
+Repo on RunPod is under **`/workspace/Second-software`**, not `/workspace/sports-main`:
+
+```bash
+cd /workspace/Second-software/sports-main/examples/soccer
+export PYTHONPATH=/workspace/Second-software/sports-main
+git pull   # need build_digit_dataset.py (6091bee+)
+
+python tools/build_digit_dataset.py \
+  --report data/jersey_ocr_v5/jersey_ocr_report.json \
+  --dump data/id_lists/track_dump_clip10min_deliver_v2.json \
+  --video /workspace/clip10min.mp4 \
+  --out-dir data/digits \
+  --clean
+```
+
+Outputs `data/digits/<N>/`, `_review_1/`, `_unlabelled/` with upper-back square crops.
+
 ### RunPod: fix cv2/numpy after a bad Paddle pip install
 
 Installing Paddle in the **same** env as the tracking stack often breaks OpenCV:
