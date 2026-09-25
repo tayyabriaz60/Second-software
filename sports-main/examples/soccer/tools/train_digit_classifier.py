@@ -68,7 +68,8 @@ def split_by_fragment(
         samples: list[tuple[Path, str]],
         val_frac: float,
         seed: int,
-) -> tuple[list[tuple[Path, str]], list[tuple[Path, str]]]:
+) -> tuple[list[tuple[Path, str]], list[tuple[Path, str]], dict]:
+    """Hold out whole fragments; stratify by class so every digit appears in val."""
     frag_to_items: dict[int, list[tuple[Path, str]]] = defaultdict(list)
     no_frag: list[tuple[Path, str]] = []
     for path, cls in samples:
@@ -77,20 +78,60 @@ def split_by_fragment(
             no_frag.append((path, cls))
         else:
             frag_to_items[fid].append((path, cls))
-    frag_ids = sorted(frag_to_items.keys())
+
+    cls_to_frags: dict[str, set[int]] = defaultdict(set)
+    for fid, items in frag_to_items.items():
+        classes = {cls for _, cls in items}
+        if len(classes) != 1:
+            # One fragment folder should be one label; use majority label.
+            cls = Counter(c for _, c in items).most_common(1)[0][0]
+        else:
+            cls = next(iter(classes))
+        cls_to_frags[cls].add(fid)
+
     rng = random.Random(seed)
-    rng.shuffle(frag_ids)
-    n_val = max(1, int(round(len(frag_ids) * val_frac)))
-    val_frags = set(frag_ids[:n_val])
-    train_frags = set(frag_ids[n_val:])
+    val_frags: set[int] = set()
+    split_info: dict[str, dict] = {}
+    for cls in sorted(cls_to_frags.keys()):
+        frags = sorted(cls_to_frags[cls])
+        rng.shuffle(frags)
+        if len(frags) == 1:
+            split_info[cls] = {
+                'train_frags': frags, 'val_frags': [],
+                'note': 'single fragment — all train',
+            }
+            continue
+        n_val = max(1, int(round(len(frags) * val_frac)))
+        n_val = min(n_val, len(frags) - 1)
+        val_cls = set(frags[:n_val])
+        val_frags |= val_cls
+        split_info[cls] = {
+            'train_frags': frags[n_val:],
+            'val_frags': frags[:n_val],
+        }
+
+    train_frags = set(frag_to_items.keys()) - val_frags
     train, val = [], []
-    for fid in train_frags:
+    for fid in sorted(train_frags):
         train.extend(frag_to_items[fid])
-    for fid in val_frags:
+    for fid in sorted(val_frags):
         val.extend(frag_to_items[fid])
-    # Rare: filenames without frag prefix -> all train
     train.extend(no_frag)
-    return train, val
+    split_info['_summary'] = {
+        'n_train': len(train),
+        'n_val': len(val),
+        'val_frags': sorted(val_frags),
+    }
+    return train, val, split_info
+
+
+def macro_val_score(val_m: dict) -> float:
+    """Mean per-class acc on val (classes with n>0 only)."""
+    accs = [
+        float(v['acc']) for v in val_m.get('per_class', {}).values()
+        if v.get('n') and v.get('acc') is not None
+    ]
+    return sum(accs) / len(accs) if accs else 0.0
 
 
 class DigitCropDataset(Dataset):
@@ -200,11 +241,17 @@ def train_main(args) -> None:
     samples, class_names = discover_samples(args.data)
     class_to_idx = {c: i for i, c in enumerate(class_names)}
     idx_to_class = {i: c for c, i in class_to_idx.items()}
-    train_items, val_items = split_by_fragment(samples, args.val_frac, args.seed)
+    train_items, val_items, split_info = split_by_fragment(
+        samples, args.val_frac, args.seed)
 
     print(f'Classes: {class_names}')
     print(f'Samples: {len(samples)} total, train {len(train_items)}, val {len(val_items)}')
-    print(f'  (split by fragment id, val_frac={args.val_frac})')
+    print(f'  (stratified fragment split, val_frac={args.val_frac})')
+    for cls in class_names:
+        si = split_info.get(cls, {})
+        if si:
+            print(f'    {cls}: val frags={si.get("val_frags")} '
+                  f'({si.get("note") or "ok"})')
 
     device = torch.device(
         'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
@@ -224,6 +271,9 @@ def train_main(args) -> None:
     crit = nn.CrossEntropyLoss()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    (args.out_dir / 'split.json').write_text(
+        json.dumps(split_info, indent=2), encoding='utf-8')
+    best_macro = -1.0
     best_acc = -1.0
     history = []
 
@@ -244,7 +294,9 @@ def train_main(args) -> None:
         history.append({'epoch': epoch, 'train_loss': train_loss, 'val': val_m})
         print(f'Epoch {epoch}/{args.epochs}  loss={train_loss:.4f}  '
               f'val_acc={val_m["acc"]:.3f}')
-        if val_m['acc'] > best_acc:
+        macro = macro_val_score(val_m)
+        if macro > best_macro:
+            best_macro = macro
             best_acc = val_m['acc']
             ckpt = {
                 'model': model.state_dict(),
@@ -252,6 +304,7 @@ def train_main(args) -> None:
                 'class_to_idx': class_to_idx,
                 'img_size': args.img_size,
                 'val_acc': best_acc,
+                'val_macro_acc': best_macro,
                 'val_metrics': val_m,
             }
             torch.save(ckpt, args.out_dir / 'best.pt')
@@ -260,11 +313,29 @@ def train_main(args) -> None:
 
     (args.out_dir / 'history.json').write_text(
         json.dumps(history, indent=2), encoding='utf-8')
-    print(f'\nBest val acc: {best_acc:.3f}  -> {args.out_dir / "best.pt"}')
+    print(f'\nBest val macro acc: {best_macro:.3f}  (overall {best_acc:.3f})')
+    print(f'  -> {args.out_dir / "best.pt"}')
     print('Per-class val (best epoch):')
     best_m = json.loads((args.out_dir / 'val_metrics.json').read_text())
     for name in class_names:
         pc = best_m['per_class'].get(name, {})
+        print(f'  {name}: n={pc.get("n")} acc={pc.get("acc")}')
+
+    all_ds = DigitCropDataset(
+        samples, class_to_idx, args.img_size, augment=False)
+    all_loader = DataLoader(all_ds, batch_size=args.batch_size, shuffle=False)
+    try:
+        best_ckpt = torch.load(
+            args.out_dir / 'best.pt', map_location=device, weights_only=False)
+    except TypeError:
+        best_ckpt = torch.load(args.out_dir / 'best.pt', map_location=device)
+    model.load_state_dict(best_ckpt['model'])
+    all_m = evaluate(model, all_loader, device, len(class_names), idx_to_class)
+    (args.out_dir / 'all_data_metrics.json').write_text(
+        json.dumps(all_m, indent=2), encoding='utf-8')
+    print('\nAll-data eval (includes train frags — optimistic):')
+    for name in class_names:
+        pc = all_m['per_class'].get(name, {})
         print(f'  {name}: n={pc.get("n")} acc={pc.get("acc")}')
 
 
@@ -284,10 +355,18 @@ def eval_main(args) -> None:
     model.to(device)
 
     samples, _ = discover_samples(args.data)
-    _, val_items = split_by_fragment(samples, args.val_frac, args.seed)
-    val_ds = DigitCropDataset(val_items, class_to_idx, img_size, augment=False)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    m = evaluate(model, val_loader, device, len(class_names), idx_to_class)
+    train_items, val_items, _ = split_by_fragment(
+        samples, args.val_frac, args.seed)
+    if args.eval_all:
+        items = samples
+        label = 'all'
+    else:
+        items = val_items
+        label = 'val'
+    ds = DigitCropDataset(items, class_to_idx, img_size, augment=False)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+    m = evaluate(model, loader, device, len(class_names), idx_to_class)
+    print(f'Eval split={label} n={len(items)}')
     print(json.dumps(m, indent=2))
 
 
@@ -299,6 +378,8 @@ def main() -> None:
     ap.add_argument('--checkpoint', type=Path, default=None,
                     help='With --eval-only, path to best.pt')
     ap.add_argument('--eval-only', action='store_true')
+    ap.add_argument('--eval-all', action='store_true',
+                    help='With --eval-only: score all JPGs (not just val frags)')
     ap.add_argument('--epochs', type=int, default=50)
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--lr', type=float, default=1e-3)
