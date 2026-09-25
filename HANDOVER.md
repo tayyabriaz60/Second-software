@@ -544,6 +544,24 @@ python tools/build_digit_dataset.py \
 
 Outputs `data/digits/<N>/`, `_review_1/`, `_unlabelled/` with upper-back square crops.
 
+### Digit classifier (step 2 — train)
+
+After `_review_1` → `10/` relabel, train on labelled folders only:
+
+```bash
+cd /workspace/Second-software/sports-main/examples/soccer
+source /workspace/venv_jersey_paddle/bin/activate   # or any env with cv2 + torch
+pip install torch torchvision   # GPU index if needed
+
+python tools/train_digit_classifier.py \
+  --data data/digits \
+  --out-dir runs/digit_cls_v1 \
+  --epochs 50
+```
+
+Check **`runs/digit_cls_v1/val_metrics.json`** — class **10** and **28** matter most.
+Then offline inference on probe frags (178, …) before touching `assign_identities.py`.
+
 ### RunPod: fix cv2/numpy after a bad Paddle pip install
 
 Installing Paddle in the **same** env as the tracking stack often breaks OpenCV:
