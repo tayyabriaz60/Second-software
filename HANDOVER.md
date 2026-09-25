@@ -529,6 +529,11 @@ cd /workspace/Second-software/sports-main/examples/soccer
 export PYTHONPATH=/workspace/Second-software/sports-main
 git pull   # need build_digit_dataset.py (6091bee+)
 
+# Same Python as jersey_ocr_probe / main.py (system python often has no cv2):
+# source /workspace/venv/bin/activate
+python -c "import cv2; print('cv2 ok', cv2.__version__)" || \
+  pip install "numpy==1.26.4" opencv-python-headless==4.10.0.84
+
 python tools/build_digit_dataset.py \
   --report data/jersey_ocr_v5/jersey_ocr_report.json \
   --dump data/id_lists/track_dump_clip10min_deliver_v2.json \

@@ -28,8 +28,19 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import cv2
-import numpy as np
+try:
+    import cv2
+    import numpy as np
+except ModuleNotFoundError as exc:
+    if exc.name in ('cv2', 'numpy'):
+        raise SystemExit(
+            'Missing OpenCV/NumPy in this Python. Use the same env as '
+            'jersey_ocr_probe (main tracking venv), e.g.:\n'
+            '  source /workspace/venv/bin/activate   # if you use one\n'
+            '  pip install "numpy==1.26.4" opencv-python-headless==4.10.0.84\n'
+            'Then re-run build_digit_dataset.py.'
+        ) from exc
+    raise
 
 _SOC = Path(__file__).resolve().parents[1]
 if str(_SOC) not in sys.path:
