@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Full-clip jersey digit probe using the trained classifier (not OCR).
 
-Memory-safe for small CPU pods: strips dump appearance vectors, streams the
-video one frame at a time (does not cache thousands of 4K frames).
+Memory-safe for CPU pods:
+  - Streams the track dump (ijson) — never json.loads the whole file
+  - Strips appearance vectors
+  - Streams video one frame at a time
+
+  pip install ijson
 
 Usage:
-  cd sports-main/examples/soccer
-  export PYTHONPATH=/workspace/Second-software/sports-main
-  source /workspace/venv_jersey_paddle/bin/activate
-
   python tools/jersey_digit_probe.py \\
     --dump data/id_lists/track_dump_clip10min_deliver_v2.json \\
     --video /workspace/clip10min.mp4 \\
@@ -22,6 +22,7 @@ import argparse
 import gc
 import json
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -39,17 +40,25 @@ try:
 except ModuleNotFoundError as exc:
     raise SystemExit('pip install torch torchvision') from exc
 
+try:
+    import ijson
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        'pip install ijson\n'
+        '(Needed to stream the track dump without OOM on CPU pods.)'
+    ) from exc
+
 from tools.build_digit_dataset import digit_back_crop
 from tools.infer_digit_classifier import load_model
 from tools.jersey_ocr_probe import (
-    eligible_fragments,
     is_consistent,
-    iter_dump_tracks,
     json_safe,
     majority_stats,
     rebuild_contact_sheet,
     sample_centre_and_height,
     upscale,
+    _spread_indices,
+    resolve_referee_class_id,
 )
 
 
@@ -85,11 +94,105 @@ def sample_frames_from_report(frag_report: dict) -> list[int]:
     return [int(ps['frame']) for ps in (frag_report.get('per_sample') or [])]
 
 
-def slim_dump_tracks(dump: dict) -> None:
-    """Drop appearance embeddings (large) to fit small CPU RAM."""
-    for tr in iter_dump_tracks(dump):
-        if 'appearance' in tr:
-            tr['appearance'] = None
+def read_dump_header(path: Path) -> dict:
+    """Read fps/width/height/start_frame from the start of the JSON (no full parse)."""
+    with open(path, 'rb') as f:
+        head = f.read(4096).decode('utf-8', errors='ignore')
+    out: dict = {}
+    for key in ('fps', 'width', 'height', 'start_frame', 'team_sep'):
+        m = re.search(rf'"{key}"\s*:\s*([0-9.eE+-]+)', head)
+        if m:
+            raw = m.group(1)
+            out[key] = float(raw) if '.' in raw or 'e' in raw.lower() else int(raw)
+    return out
+
+
+def stream_load_tracks(
+        path: Path,
+        want_ids: set[int] | None,
+) -> list[dict]:
+    """Stream tracks.item; keep only want_ids (if set); drop appearance."""
+    tracks: list[dict] = []
+    n_seen = 0
+    with open(path, 'rb') as f:
+        for tr in ijson.items(f, 'tracks.item'):
+            n_seen += 1
+            if n_seen % 200 == 0:
+                print(f'  ...scanned {n_seen} tracklets, kept {len(tracks)}',
+                      flush=True)
+            tid = int(tr.get('id', -1))
+            if want_ids is not None and tid not in want_ids:
+                continue
+            tr.pop('appearance', None)
+            # Drop nothing else — need frames, xy, h, class, team
+            tracks.append(tr)
+    print(f'  Stream done: scanned {n_seen}, kept {len(tracks)}', flush=True)
+    return tracks
+
+
+def heights_from_track(tr: dict) -> list[float]:
+    raw = tr.get('h') or tr.get('box_height_px') or tr.get('heights') or []
+    if not isinstance(raw, list):
+        return [0.0] * len(tr.get('frames') or [])
+    out = []
+    for v in raw:
+        try:
+            out.append(float(v) if v not in (None, '') else 0.0)
+        except (TypeError, ValueError):
+            out.append(0.0)
+    n = len(tr.get('frames') or [])
+    if len(out) < n:
+        out.extend([0.0] * (n - len(out)))
+    return out[:n]
+
+
+def build_eligible_from_tracks(
+        tracks: list[dict],
+        min_h: float,
+        min_large_frames: int,
+        max_samples: int,
+        skip_referees: bool,
+        referee_class: int,
+        report_by_id: dict[int, dict],
+) -> list[dict]:
+    """Eligibility using dump h only (no full-dump y-fallback model)."""
+    eligible = []
+    for tr in tracks:
+        if skip_referees and int(tr.get('class', 1)) == referee_class:
+            continue
+        tid = int(tr['id'])
+        frames = tr.get('frames') or []
+        hs = heights_from_track(tr)
+        if tid in report_by_id:
+            # Trust OCR-v5 eligibility; use report sample frames later
+            sample_frames = sample_frames_from_report(report_by_id[tid])
+            # Map to indices if possible; heights aligned to dump frames
+            eligible.append({
+                'id': tid,
+                'team': tr.get('team'),
+                'class': tr.get('class'),
+                'n_large': sum(1 for h in hs if h >= min_h),
+                'sample_idx': [],  # unused when report frames set
+                'sample_frames': sample_frames,
+                'frames': frames,
+                'heights': hs,
+            })
+            continue
+        large_idx = [i for i, h in enumerate(hs) if float(h) >= min_h]
+        if len(large_idx) < min_large_frames:
+            continue
+        sample_idx = _spread_indices(large_idx, max_samples)
+        eligible.append({
+            'id': tid,
+            'team': tr.get('team'),
+            'class': tr.get('class'),
+            'n_large': len(large_idx),
+            'sample_idx': sample_idx,
+            'sample_frames': [int(frames[i]) for i in sample_idx],
+            'frames': frames,
+            'heights': hs,
+        })
+    return eligible
 
 
 def stream_classify(
@@ -104,7 +207,6 @@ def stream_classify(
         upscale_factor: float,
         frag_state: dict[int, dict],
 ) -> int:
-    """One forward pass over the video; process crops; free each frame."""
     if not need_clip:
         return 0
     cap = cv2.VideoCapture(str(video))
@@ -151,7 +253,6 @@ def stream_classify(
                     })
                     if num is not None and conf > st['best_conf']:
                         st['best_conf'] = conf
-                        # Keep a small thumb only (contact sheet); drop later if none
                         st['_thumb'] = up.copy()
                 remaining.discard(frame_idx)
                 n_hit += 1
@@ -185,8 +286,7 @@ def main() -> None:
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--max-fragments', type=int, default=0)
     ap.add_argument('--only-fragments', type=str, default=None)
-    ap.add_argument('--gpu', action='store_true',
-                    help='Use CUDA if available (default: CPU)')
+    ap.add_argument('--gpu', action='store_true')
     ap.add_argument('--include-referees', action='store_true')
     ap.add_argument('--referee-class', type=int, default=None)
     args = ap.parse_args()
@@ -200,63 +300,71 @@ def main() -> None:
     print(f'Classes: {[idx_to_class[i] for i in range(len(idx_to_class))]}',
           flush=True)
 
-    print(f'Loading dump (may take a minute)... {args.dump}', flush=True)
-    dump = json.loads(args.dump.read_text(encoding='utf-8'))
-    slim_dump_tracks(dump)
-    gc.collect()
-    print('  Dump loaded; appearance vectors stripped for RAM.', flush=True)
-
-    start_frame = int(dump.get('start_frame') or 0)
-
-    eligible, height_diag = eligible_fragments(
-        dump, args.min_h, args.min_large_frames, args.max_samples,
-        skip_referees=not args.include_referees,
-        referee_class=args.referee_class)
-    track_by_id = {int(t['id']): t for t in iter_dump_tracks(dump)}
-
     report_by_id: dict[int, dict] = {}
+    want_ids: set[int] | None = None
     if args.replay_report and args.replay_report.is_file():
         prior = json.loads(args.replay_report.read_text(encoding='utf-8'))
         report_by_id = {
             int(f['fragment_id']): f for f in prior.get('fragments') or []
         }
-        want = set(report_by_id.keys())
-        eligible = [e for e in eligible if int(e['id']) in want]
-        order = {fid: i for i, fid in enumerate(report_by_id.keys())}
-        eligible.sort(key=lambda e: order.get(int(e['id']), 10**9))
-        print(f'Replay OCR report: {len(eligible)} fragments with prior samples',
-              flush=True)
+        want_ids = set(report_by_id.keys())
+        print(f'Replay report: {len(want_ids)} fragment ids', flush=True)
 
     if args.only_fragments:
-        want_only = {
+        only = {
             int(x.strip()) for x in args.only_fragments.split(',') if x.strip()
         }
-        eligible = [e for e in eligible if int(e['id']) in want_only]
+        want_ids = only if want_ids is None else (want_ids & only)
+        print(f'Only fragments: {sorted(want_ids) if want_ids else only}',
+              flush=True)
+
+    header = read_dump_header(args.dump)
+    start_frame = int(header.get('start_frame') or 0)
+    print(f'Dump header: {header}', flush=True)
+    print(f'Streaming dump tracks from {args.dump.name} '
+          f'(want_ids={len(want_ids) if want_ids else "ALL"})...', flush=True)
+
+    tracks = stream_load_tracks(args.dump, want_ids)
+    gc.collect()
+
+    # Minimal dump dict for referee class resolution
+    dump_meta = dict(header)
+    dump_meta['tracks'] = tracks
+    ref_cls = resolve_referee_class_id(dump_meta, args.referee_class)
+
+    eligible = build_eligible_from_tracks(
+        tracks,
+        args.min_h,
+        args.min_large_frames,
+        args.max_samples,
+        skip_referees=not args.include_referees,
+        referee_class=ref_cls,
+        report_by_id=report_by_id,
+    )
+
+    if report_by_id:
+        order = {fid: i for i, fid in enumerate(report_by_id.keys())}
+        eligible.sort(key=lambda e: order.get(int(e['id']), 10**9))
 
     if args.max_fragments and len(eligible) > args.max_fragments:
         rng = random.Random(args.seed)
         eligible = rng.sample(eligible, args.max_fragments)
 
+    track_by_id = {int(t['id']): t for t in tracks}
     need: set[int] = set()
     frag_frame_list: dict[int, list[int]] = {}
     for e in eligible:
         tid = int(e['id'])
-        if tid in report_by_id:
-            frames = sample_frames_from_report(report_by_id[tid])
-        else:
-            frames = [int(e['frames'][si]) for si in e['sample_idx']]
+        frames = e.get('sample_frames') or []
         frag_frame_list[tid] = frames
         need.update(frames)
 
-    print(f'Dump: {args.dump.name}', flush=True)
-    print(f'  Height diagnostics: {height_diag}', flush=True)
     print(f'Eligible / probing: {len(eligible)}', flush=True)
     print(f'Unique frames to decode: {len(need)}', flush=True)
     if need:
         print(f'  Clip frame range: {min(need)}..{max(need)} '
               f'(dump start_frame={start_frame})', flush=True)
 
-    # Build per-frame job list (no full-frame cache)
     jobs_by_frame: dict[int, list[dict]] = defaultdict(list)
     frag_state: dict[int, dict] = {}
     meta_by_id = {int(e['id']): e for e in eligible}
@@ -287,12 +395,12 @@ def main() -> None:
                 'tid': tid, 'cx': cx, 'cy': cy, 'h': h,
             })
 
-    # Free track maps we no longer need for decode (keep frag_state / meta)
+    del tracks
     del track_by_id
-    dump['tracks'] = []
+    dump_meta['tracks'] = []
     gc.collect()
 
-    print('Streaming video decode + classify (low RAM)...', flush=True)
+    print('Streaming video decode + classify...', flush=True)
     n_hit = stream_classify(
         args.video, start_frame, need, jobs_by_frame,
         model, transform, device, idx_to_class, args.upscale, frag_state)
@@ -374,7 +482,7 @@ def main() -> None:
         'device': str(device),
         'replay_report': str(args.replay_report) if args.replay_report else None,
         'params': json_safe(vars(args)),
-        'height_diagnostics': height_diag,
+        'dump_header': header,
         'summary': {
             'fragments_probed': n_probed,
             'any_read': n_any,
