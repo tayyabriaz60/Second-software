@@ -527,7 +527,11 @@ def main() -> None:
     print('Streaming video decode + classify...', flush=True)
     n_hit = stream_classify(
         args.video, start_frame, need, jobs_by_frame,
-        model, transform, device, idx_to_class, args.upscale, frag_state)
+        model, transform, device, idx_to_class, args.upscale, frag_state,
+        frame_w=int(header.get('width') or 0),
+        frame_h=int(header.get('height') or 0),
+        decoder=args.decoder,
+    )
     print(f'  Hit {n_hit}/{len(need)} target frame(s)', flush=True)
 
     results = []
