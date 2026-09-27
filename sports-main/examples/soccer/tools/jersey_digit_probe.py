@@ -195,7 +195,116 @@ def build_eligible_from_tracks(
     return eligible
 
 
-def stream_classify(
+def _process_frame_jobs(
+        frame: np.ndarray,
+        clip_idx: int,
+        jobs_by_frame: dict[int, list[dict]],
+        model,
+        transform,
+        device: torch.device,
+        idx_to_class: dict[int, str],
+        upscale_factor: float,
+        frag_state: dict[int, dict],
+) -> None:
+    for job in jobs_by_frame.get(clip_idx, []):
+        tid = job['tid']
+        crop, _ = digit_back_crop(frame, job['cx'], job['cy'], job['h'])
+        up = upscale(crop, upscale_factor)
+        num, conf, raw = predict_crop(
+            model, transform, up, device, idx_to_class)
+        st = frag_state[tid]
+        if num is not None:
+            st['all_reads'].append((num, conf))
+        st['per_sample'].append({
+            'frame': clip_idx,
+            'h': job['h'],
+            'reads': (
+                [{'number': num, 'confidence': round(conf, 3),
+                  'raw_digits': raw}]
+                if num is not None else []
+            ),
+        })
+        if num is not None and conf > st['best_conf']:
+            st['best_conf'] = conf
+            st['_thumb'] = up.copy()
+
+
+def stream_classify_ffmpeg(
+        video: Path,
+        start_frame: int,
+        frame_w: int,
+        frame_h: int,
+        need_clip: set[int],
+        jobs_by_frame: dict[int, list[dict]],
+        model,
+        transform,
+        device: torch.device,
+        idx_to_class: dict[int, str],
+        upscale_factor: float,
+        frag_state: dict[int, dict],
+) -> int:
+    """Decode via ffmpeg rawvideo pipe — one frame buffer, no OpenCV 4K caches."""
+    import subprocess
+
+    if not need_clip:
+        return 0
+    if frame_w <= 0 or frame_h <= 0:
+        raise SystemExit('Dump header missing width/height for ffmpeg decode')
+
+    needed_abs = {f + int(start_frame) for f in need_clip}
+    max_abs = max(needed_abs)
+    remaining = set(needed_abs)
+    nbytes = int(frame_w) * int(frame_h) * 3
+    cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'error',
+        '-i', str(video),
+        '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+        '-vsync', '0',
+        '-',
+    ]
+    print(f'  ffmpeg pipe {frame_w}x{frame_h} (~{nbytes / 1e6:.1f} MB/frame)',
+          flush=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=nbytes * 2)
+    assert proc.stdout is not None
+    n_hit = 0
+    frame_idx = 0
+    try:
+        while frame_idx <= max_abs and remaining:
+            raw = proc.stdout.read(nbytes)
+            if raw is None or len(raw) < nbytes:
+                err = proc.stderr.read().decode('utf-8', errors='ignore') if proc.stderr else ''
+                print(f'  ffmpeg EOF at frame {frame_idx}: {err[:300]}', flush=True)
+                break
+            if frame_idx in remaining:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (int(frame_h), int(frame_w), 3))
+                clip_idx = frame_idx - int(start_frame)
+                _process_frame_jobs(
+                    frame, clip_idx, jobs_by_frame, model, transform,
+                    device, idx_to_class, upscale_factor, frag_state)
+                remaining.discard(frame_idx)
+                n_hit += 1
+                if n_hit == 1:
+                    print(f'  first hit ok at abs frame {frame_idx}', flush=True)
+                del frame
+            # non-needed frames: discard buffer without reshape copy
+            del raw
+            if frame_idx % 2000 == 0 and frame_idx > 0:
+                print(f'  decode: video frame {frame_idx}/{max_abs}, '
+                      f'hits {n_hit}/{len(need_clip)}', flush=True)
+                gc.collect()
+            frame_idx += 1
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    return n_hit
+
+
+def stream_classify_opencv(
         video: Path,
         start_frame: int,
         need_clip: set[int],
@@ -212,6 +321,10 @@ def stream_classify(
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise SystemExit(f'Cannot open video: {video}')
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     needed_abs = {f + int(start_frame) for f in need_clip}
     max_abs = max(needed_abs)
@@ -232,28 +345,9 @@ def stream_classify(
                 if not ok:
                     break
                 clip_idx = frame_idx - int(start_frame)
-                for job in jobs_by_frame.get(clip_idx, []):
-                    tid = job['tid']
-                    cx, cy, h = job['cx'], job['cy'], job['h']
-                    crop, _ = digit_back_crop(frame, cx, cy, h)
-                    up = upscale(crop, upscale_factor)
-                    num, conf, raw = predict_crop(
-                        model, transform, up, device, idx_to_class)
-                    st = frag_state[tid]
-                    if num is not None:
-                        st['all_reads'].append((num, conf))
-                    st['per_sample'].append({
-                        'frame': clip_idx,
-                        'h': h,
-                        'reads': (
-                            [{'number': num, 'confidence': round(conf, 3),
-                              'raw_digits': raw}]
-                            if num is not None else []
-                        ),
-                    })
-                    if num is not None and conf > st['best_conf']:
-                        st['best_conf'] = conf
-                        st['_thumb'] = up.copy()
+                _process_frame_jobs(
+                    frame, clip_idx, jobs_by_frame, model, transform,
+                    device, idx_to_class, upscale_factor, frag_state)
                 remaining.discard(frame_idx)
                 n_hit += 1
                 del frame
@@ -263,10 +357,38 @@ def stream_classify(
             if log_every and frame_idx % log_every == 0:
                 print(f'  decode: video frame {frame_idx}/{max_abs}, '
                       f'hits {n_hit}/{len(need_clip)}', flush=True)
+                gc.collect()
             frame_idx += 1
     finally:
         cap.release()
     return n_hit
+
+
+def stream_classify(
+        video: Path,
+        start_frame: int,
+        need_clip: set[int],
+        jobs_by_frame: dict[int, list[dict]],
+        model,
+        transform,
+        device: torch.device,
+        idx_to_class: dict[int, str],
+        upscale_factor: float,
+        frag_state: dict[int, dict],
+        *,
+        frame_w: int,
+        frame_h: int,
+        decoder: str,
+) -> int:
+    if decoder == 'opencv':
+        print('  decoder=opencv', flush=True)
+        return stream_classify_opencv(
+            video, start_frame, need_clip, jobs_by_frame, model, transform,
+            device, idx_to_class, upscale_factor, frag_state)
+    print('  decoder=ffmpeg (default, low RAM)', flush=True)
+    return stream_classify_ffmpeg(
+        video, start_frame, frame_w, frame_h, need_clip, jobs_by_frame,
+        model, transform, device, idx_to_class, upscale_factor, frag_state)
 
 
 def main() -> None:
@@ -287,6 +409,8 @@ def main() -> None:
     ap.add_argument('--max-fragments', type=int, default=0)
     ap.add_argument('--only-fragments', type=str, default=None)
     ap.add_argument('--gpu', action='store_true')
+    ap.add_argument('--decoder', choices=('ffmpeg', 'opencv'), default='ffmpeg',
+                    help='Video decode backend (ffmpeg default: low RAM on CPU pods)')
     ap.add_argument('--include-referees', action='store_true')
     ap.add_argument('--referee-class', type=int, default=None)
     args = ap.parse_args()
