@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Full-clip jersey digit probe using the trained classifier (not OCR).
 
-Memory-safe for CPU pods:
-  - Streams the track dump (ijson) — never json.loads the whole file
-  - Strips appearance vectors
-  - Streams video one frame at a time
+CPU-pod safe path:
+  1) Stream dump with ijson (only needed tracks)
+  2) Extract needed frames to JPEG on disk (ffmpeg, no torch in RAM)
+  3) Load classifier and run on JPEGs
 
   pip install ijson
+  apt-get install -y ffmpeg
 
 Usage:
   python tools/jersey_digit_probe.py \\
@@ -23,6 +24,7 @@ import gc
 import json
 import random
 import re
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -35,12 +37,6 @@ if str(_SOC) not in sys.path:
     sys.path.insert(0, str(_SOC))
 
 try:
-    import torch
-    from torchvision import transforms
-except ModuleNotFoundError as exc:
-    raise SystemExit('pip install torch torchvision') from exc
-
-try:
     import ijson
 except ModuleNotFoundError as exc:
     raise SystemExit(
@@ -49,7 +45,6 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from tools.build_digit_dataset import digit_back_crop
-from tools.infer_digit_classifier import load_model
 from tools.jersey_ocr_probe import (
     is_consistent,
     json_safe,
@@ -62,40 +57,11 @@ from tools.jersey_ocr_probe import (
 )
 
 
-def _tfm(img_size: int):
-    return transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-
-
-@torch.no_grad()
-def predict_crop(
-        model, transform, crop_bgr: np.ndarray, device: torch.device,
-        idx_to_class: dict[int, str],
-) -> tuple[int | None, float, str]:
-    if crop_bgr.size == 0:
-        return None, 0.0, ''
-    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    x = transform(rgb).unsqueeze(0).to(device)
-    probs = torch.softmax(model(x), dim=1)[0]
-    conf, pred = probs.max(dim=0)
-    label = idx_to_class[int(pred.item())]
-    try:
-        num = int(label)
-    except ValueError:
-        return None, float(conf.item()), label
-    return num, float(conf.item()), label
-
-
 def sample_frames_from_report(frag_report: dict) -> list[int]:
     return [int(ps['frame']) for ps in (frag_report.get('per_sample') or [])]
 
 
 def read_dump_header(path: Path) -> dict:
-    """Read fps/width/height/start_frame from the start of the JSON (no full parse)."""
     with open(path, 'rb') as f:
         head = f.read(4096).decode('utf-8', errors='ignore')
     out: dict = {}
@@ -107,11 +73,7 @@ def read_dump_header(path: Path) -> dict:
     return out
 
 
-def stream_load_tracks(
-        path: Path,
-        want_ids: set[int] | None,
-) -> list[dict]:
-    """Stream tracks.item; keep only want_ids (if set); drop appearance."""
+def stream_load_tracks(path: Path, want_ids: set[int] | None) -> list[dict]:
     tracks: list[dict] = []
     n_seen = 0
     with open(path, 'rb') as f:
@@ -124,7 +86,6 @@ def stream_load_tracks(
             if want_ids is not None and tid not in want_ids:
                 continue
             tr.pop('appearance', None)
-            # Drop nothing else — need frames, xy, h, class, team
             tracks.append(tr)
     print(f'  Stream done: scanned {n_seen}, kept {len(tracks)}', flush=True)
     return tracks
@@ -155,7 +116,6 @@ def build_eligible_from_tracks(
         referee_class: int,
         report_by_id: dict[int, dict],
 ) -> list[dict]:
-    """Eligibility using dump h only (no full-dump y-fallback model)."""
     eligible = []
     for tr in tracks:
         if skip_referees and int(tr.get('class', 1)) == referee_class:
@@ -164,15 +124,13 @@ def build_eligible_from_tracks(
         frames = tr.get('frames') or []
         hs = heights_from_track(tr)
         if tid in report_by_id:
-            # Trust OCR-v5 eligibility; use report sample frames later
             sample_frames = sample_frames_from_report(report_by_id[tid])
-            # Map to indices if possible; heights aligned to dump frames
             eligible.append({
                 'id': tid,
                 'team': tr.get('team'),
                 'class': tr.get('class'),
                 'n_large': sum(1 for h in hs if h >= min_h),
-                'sample_idx': [],  # unused when report frames set
+                'sample_idx': [],
                 'sample_frames': sample_frames,
                 'frames': frames,
                 'heights': hs,
@@ -195,105 +153,84 @@ def build_eligible_from_tracks(
     return eligible
 
 
-def _process_frame_jobs(
-        frame: np.ndarray,
-        clip_idx: int,
-        jobs_by_frame: dict[int, list[dict]],
-        model,
-        transform,
-        device: torch.device,
-        idx_to_class: dict[int, str],
-        upscale_factor: float,
-        frag_state: dict[int, dict],
-) -> None:
-    for job in jobs_by_frame.get(clip_idx, []):
-        tid = job['tid']
-        crop, _ = digit_back_crop(frame, job['cx'], job['cy'], job['h'])
-        up = upscale(crop, upscale_factor)
-        num, conf, raw = predict_crop(
-            model, transform, up, device, idx_to_class)
-        st = frag_state[tid]
-        if num is not None:
-            st['all_reads'].append((num, conf))
-        st['per_sample'].append({
-            'frame': clip_idx,
-            'h': job['h'],
-            'reads': (
-                [{'number': num, 'confidence': round(conf, 3),
-                  'raw_digits': raw}]
-                if num is not None else []
-            ),
-        })
-        if num is not None and conf > st['best_conf']:
-            st['best_conf'] = conf
-            st['_thumb'] = up.copy()
-
-
-def stream_classify_ffmpeg(
+def extract_frames_jpeg(
         video: Path,
         start_frame: int,
+        need_clip: set[int],
+        out_dir: Path,
         frame_w: int,
         frame_h: int,
-        need_clip: set[int],
-        jobs_by_frame: dict[int, list[dict]],
-        model,
-        transform,
-        device: torch.device,
-        idx_to_class: dict[int, str],
-        upscale_factor: float,
-        frag_state: dict[int, dict],
-) -> int:
-    """Decode via ffmpeg rawvideo pipe — one frame buffer, no OpenCV 4K caches."""
-    import subprocess
+) -> dict[int, Path]:
+    """Sequential ffmpeg raw decode; write only needed frames as JPEG.
 
+    Runs before torch is loaded so RAM stays low. One frame buffer at a time.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
     if not need_clip:
-        return 0
+        return {}
     if frame_w <= 0 or frame_h <= 0:
-        raise SystemExit('Dump header missing width/height for ffmpeg decode')
+        raise SystemExit('Dump header missing width/height')
 
-    needed_abs = {f + int(start_frame) for f in need_clip}
-    max_abs = max(needed_abs)
-    remaining = set(needed_abs)
+    need_abs = {int(f) + int(start_frame) for f in need_clip}
+    max_abs = max(need_abs)
+    remaining = set(need_abs)
+    mapping: dict[int, Path] = {}
+    # Resume: already on disk
+    for abs_f in list(need_abs):
+        clip_f = abs_f - int(start_frame)
+        dest = out_dir / f'clip{clip_f}_abs{abs_f}.jpg'
+        if dest.is_file() and dest.stat().st_size > 0:
+            mapping[clip_f] = dest
+            remaining.discard(abs_f)
+
+    if not remaining:
+        print(f'Reusing {len(mapping)} existing JPEGs in {out_dir}', flush=True)
+        return mapping
+
     nbytes = int(frame_w) * int(frame_h) * 3
     cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'error',
+        '-threads', '1',
         '-i', str(video),
         '-f', 'rawvideo', '-pix_fmt', 'bgr24',
         '-vsync', '0',
         '-',
     ]
-    print(f'  ffmpeg pipe {frame_w}x{frame_h} (~{nbytes / 1e6:.1f} MB/frame)',
+    print(f'Sequential extract {len(remaining)} frames '
+          f'(through abs {max_abs}), ~{nbytes / 1e6:.1f} MB/frame...',
           flush=True)
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=nbytes * 2)
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=nbytes)
     assert proc.stdout is not None
-    n_hit = 0
     frame_idx = 0
+    n_wrote = 0
     try:
         while frame_idx <= max_abs and remaining:
             raw = proc.stdout.read(nbytes)
             if raw is None or len(raw) < nbytes:
-                err = proc.stderr.read().decode('utf-8', errors='ignore') if proc.stderr else ''
-                print(f'  ffmpeg EOF at frame {frame_idx}: {err[:300]}', flush=True)
+                err = ''
+                if proc.stderr:
+                    err = proc.stderr.read().decode('utf-8', errors='ignore')[:300]
+                print(f'  ffmpeg EOF at {frame_idx}: {err}', flush=True)
                 break
             if frame_idx in remaining:
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                     (int(frame_h), int(frame_w), 3))
-                clip_idx = frame_idx - int(start_frame)
-                _process_frame_jobs(
-                    frame, clip_idx, jobs_by_frame, model, transform,
-                    device, idx_to_class, upscale_factor, frag_state)
+                clip_f = frame_idx - int(start_frame)
+                dest = out_dir / f'clip{clip_f}_abs{frame_idx}.jpg'
+                cv2.imwrite(str(dest), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                mapping[clip_f] = dest
                 remaining.discard(frame_idx)
-                n_hit += 1
-                if n_hit == 1:
-                    print(f'  first hit ok at abs frame {frame_idx}', flush=True)
+                n_wrote += 1
+                if n_wrote == 1:
+                    print(f'  first JPEG ok at abs {frame_idx}', flush=True)
                 del frame
-            # non-needed frames: discard buffer without reshape copy
+                if n_wrote % 25 == 0:
+                    print(f'  wrote {n_wrote}, left {len(remaining)}', flush=True)
+                    gc.collect()
             del raw
             if frame_idx % 2000 == 0 and frame_idx > 0:
-                print(f'  decode: video frame {frame_idx}/{max_abs}, '
-                      f'hits {n_hit}/{len(need_clip)}', flush=True)
-                gc.collect()
+                print(f'  pass frame {frame_idx}/{max_abs}', flush=True)
             frame_idx += 1
     finally:
         proc.kill()
@@ -301,94 +238,65 @@ def stream_classify_ffmpeg(
             proc.wait(timeout=5)
         except Exception:
             pass
-    return n_hit
+    print(f'  JPEGs ready: {len(mapping)}/{len(need_clip)}', flush=True)
+    return mapping
 
 
-def stream_classify_opencv(
-        video: Path,
-        start_frame: int,
-        need_clip: set[int],
+def classify_from_jpegs(
+        frame_paths: dict[int, Path],
         jobs_by_frame: dict[int, list[dict]],
+        frag_state: dict[int, dict],
         model,
         transform,
-        device: torch.device,
+        device,
         idx_to_class: dict[int, str],
         upscale_factor: float,
-        frag_state: dict[int, dict],
 ) -> int:
-    if not need_clip:
-        return 0
-    cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        raise SystemExit(f'Cannot open video: {video}')
-    try:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    except Exception:
-        pass
+    import torch
 
-    needed_abs = {f + int(start_frame) for f in need_clip}
-    max_abs = max(needed_abs)
-    remaining = set(needed_abs)
     n_hit = 0
-    frame_idx = 0
-    try:
-        for _ in range(int(start_frame)):
-            if not cap.grab():
-                return n_hit
-            frame_idx += 1
-
-        span = max(1, max_abs - frame_idx)
-        log_every = max(500, span // 20)
-        while frame_idx <= max_abs and remaining:
-            if frame_idx in remaining:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                clip_idx = frame_idx - int(start_frame)
-                _process_frame_jobs(
-                    frame, clip_idx, jobs_by_frame, model, transform,
-                    device, idx_to_class, upscale_factor, frag_state)
-                remaining.discard(frame_idx)
-                n_hit += 1
-                del frame
-            else:
-                if not cap.grab():
-                    break
-            if log_every and frame_idx % log_every == 0:
-                print(f'  decode: video frame {frame_idx}/{max_abs}, '
-                      f'hits {n_hit}/{len(need_clip)}', flush=True)
-                gc.collect()
-            frame_idx += 1
-    finally:
-        cap.release()
+    for clip_f in sorted(frame_paths.keys()):
+        path = frame_paths[clip_f]
+        frame = cv2.imread(str(path))
+        if frame is None:
+            continue
+        n_hit += 1
+        for job in jobs_by_frame.get(clip_f, []):
+            tid = job['tid']
+            crop, _ = digit_back_crop(frame, job['cx'], job['cy'], job['h'])
+            up = upscale(crop, upscale_factor)
+            if up.size == 0:
+                continue
+            rgb = cv2.cvtColor(up, cv2.COLOR_BGR2RGB)
+            x = transform(rgb).unsqueeze(0).to(device)
+            with torch.no_grad():
+                probs = torch.softmax(model(x), dim=1)[0]
+                conf, pred = probs.max(dim=0)
+            label = idx_to_class[int(pred.item())]
+            try:
+                num = int(label)
+            except ValueError:
+                num = None
+            conf_f = float(conf.item())
+            st = frag_state[tid]
+            if num is not None:
+                st['all_reads'].append((num, conf_f))
+            st['per_sample'].append({
+                'frame': clip_f,
+                'h': job['h'],
+                'reads': (
+                    [{'number': num, 'confidence': round(conf_f, 3),
+                      'raw_digits': label}]
+                    if num is not None else []
+                ),
+            })
+            if num is not None and conf_f > st['best_conf']:
+                st['best_conf'] = conf_f
+                st['_thumb'] = up.copy()
+        del frame
+        if n_hit % 20 == 0:
+            gc.collect()
     return n_hit
-
-
-def stream_classify(
-        video: Path,
-        start_frame: int,
-        need_clip: set[int],
-        jobs_by_frame: dict[int, list[dict]],
-        model,
-        transform,
-        device: torch.device,
-        idx_to_class: dict[int, str],
-        upscale_factor: float,
-        frag_state: dict[int, dict],
-        *,
-        frame_w: int,
-        frame_h: int,
-        decoder: str,
-) -> int:
-    if decoder == 'opencv':
-        print('  decoder=opencv', flush=True)
-        return stream_classify_opencv(
-            video, start_frame, need_clip, jobs_by_frame, model, transform,
-            device, idx_to_class, upscale_factor, frag_state)
-    print('  decoder=ffmpeg (default, low RAM)', flush=True)
-    return stream_classify_ffmpeg(
-        video, start_frame, frame_w, frame_h, need_clip, jobs_by_frame,
-        model, transform, device, idx_to_class, upscale_factor, frag_state)
 
 
 def main() -> None:
@@ -398,8 +306,7 @@ def main() -> None:
     ap.add_argument('--video', type=Path, required=True)
     ap.add_argument('--checkpoint', type=Path, required=True)
     ap.add_argument('--out-dir', type=Path, default=Path('data/jersey_digit_v1'))
-    ap.add_argument('--replay-report', type=Path, default=None,
-                    help='OCR jersey_ocr_report.json: same frags + sample frames')
+    ap.add_argument('--replay-report', type=Path, default=None)
     ap.add_argument('--min-h', type=float, default=200.0)
     ap.add_argument('--min-large-frames', type=int, default=20)
     ap.add_argument('--max-samples', type=int, default=30)
@@ -409,20 +316,15 @@ def main() -> None:
     ap.add_argument('--max-fragments', type=int, default=0)
     ap.add_argument('--only-fragments', type=str, default=None)
     ap.add_argument('--gpu', action='store_true')
-    ap.add_argument('--decoder', choices=('ffmpeg', 'opencv'), default='ffmpeg',
-                    help='Video decode backend (ffmpeg default: low RAM on CPU pods)')
+    ap.add_argument('--frames-dir', type=Path, default=None,
+                    help='JPEG cache dir (default: out-dir/frames)')
+    ap.add_argument('--skip-extract', action='store_true',
+                    help='Reuse existing JPEGs in --frames-dir')
+    ap.add_argument('--keep-frames', action='store_true',
+                    help='Do not delete extracted JPEGs at end')
     ap.add_argument('--include-referees', action='store_true')
     ap.add_argument('--referee-class', type=int, default=None)
     args = ap.parse_args()
-
-    use_cuda = bool(args.gpu and torch.cuda.is_available())
-    device = torch.device('cuda' if use_cuda else 'cpu')
-    print(f'Device: {device}', flush=True)
-
-    model, idx_to_class, img_size = load_model(args.checkpoint, device)
-    transform = _tfm(img_size)
-    print(f'Classes: {[idx_to_class[i] for i in range(len(idx_to_class))]}',
-          flush=True)
 
     report_by_id: dict[int, dict] = {}
     want_ids: set[int] | None = None
@@ -439,37 +341,30 @@ def main() -> None:
             int(x.strip()) for x in args.only_fragments.split(',') if x.strip()
         }
         want_ids = only if want_ids is None else (want_ids & only)
-        print(f'Only fragments: {sorted(want_ids) if want_ids else only}',
-              flush=True)
+        print(f'Only fragments: {sorted(want_ids)}', flush=True)
 
     header = read_dump_header(args.dump)
     start_frame = int(header.get('start_frame') or 0)
     print(f'Dump header: {header}', flush=True)
-    print(f'Streaming dump tracks from {args.dump.name} '
-          f'(want_ids={len(want_ids) if want_ids else "ALL"})...', flush=True)
+    print(f'Streaming dump tracks (want_ids='
+          f'{len(want_ids) if want_ids else "ALL"})...', flush=True)
 
     tracks = stream_load_tracks(args.dump, want_ids)
     gc.collect()
 
-    # Minimal dump dict for referee class resolution
     dump_meta = dict(header)
     dump_meta['tracks'] = tracks
     ref_cls = resolve_referee_class_id(dump_meta, args.referee_class)
 
     eligible = build_eligible_from_tracks(
-        tracks,
-        args.min_h,
-        args.min_large_frames,
-        args.max_samples,
+        tracks, args.min_h, args.min_large_frames, args.max_samples,
         skip_referees=not args.include_referees,
         referee_class=ref_cls,
         report_by_id=report_by_id,
     )
-
     if report_by_id:
         order = {fid: i for i, fid in enumerate(report_by_id.keys())}
         eligible.sort(key=lambda e: order.get(int(e['id']), 10**9))
-
     if args.max_fragments and len(eligible) > args.max_fragments:
         rng = random.Random(args.seed)
         eligible = rng.sample(eligible, args.max_fragments)
@@ -484,18 +379,15 @@ def main() -> None:
         need.update(frames)
 
     print(f'Eligible / probing: {len(eligible)}', flush=True)
-    print(f'Unique frames to decode: {len(need)}', flush=True)
+    print(f'Unique frames to extract: {len(need)}', flush=True)
     if need:
-        print(f'  Clip frame range: {min(need)}..{max(need)} '
-              f'(dump start_frame={start_frame})', flush=True)
+        print(f'  Clip frame range: {min(need)}..{max(need)}', flush=True)
 
     jobs_by_frame: dict[int, list[dict]] = defaultdict(list)
     frag_state: dict[int, dict] = {}
-    meta_by_id = {int(e['id']): e for e in eligible}
-
     for tid, sample_frames in frag_frame_list.items():
         tr = track_by_id.get(tid)
-        meta = meta_by_id.get(tid)
+        meta = next((e for e in eligible if int(e['id']) == tid), None)
         if tr is None or meta is None:
             continue
         frames = tr['frames']
@@ -524,15 +416,53 @@ def main() -> None:
     dump_meta['tracks'] = []
     gc.collect()
 
-    print('Streaming video decode + classify...', flush=True)
-    n_hit = stream_classify(
-        args.video, start_frame, need, jobs_by_frame,
-        model, transform, device, idx_to_class, args.upscale, frag_state,
-        frame_w=int(header.get('width') or 0),
-        frame_h=int(header.get('height') or 0),
-        decoder=args.decoder,
-    )
-    print(f'  Hit {n_hit}/{len(need)} target frame(s)', flush=True)
+    frames_dir = args.frames_dir or (args.out_dir / 'frames')
+    if args.skip_extract:
+        frame_paths = {}
+        for clip_f in need:
+            abs_f = clip_f + start_frame
+            dest = frames_dir / f'clip{clip_f}_abs{abs_f}.jpg'
+            if dest.is_file():
+                frame_paths[clip_f] = dest
+        print(f'Reusing {len(frame_paths)} JPEGs from {frames_dir}', flush=True)
+    else:
+        frame_paths = extract_frames_jpeg(
+            args.video, start_frame, need, frames_dir,
+            frame_w=int(header.get('width') or 0),
+            frame_h=int(header.get('height') or 0),
+        )
+
+    print('Loading torch + classifier (after extract)...', flush=True)
+    try:
+        import torch
+        from torchvision import transforms
+    except ModuleNotFoundError as exc:
+        raise SystemExit('pip install torch torchvision') from exc
+
+    from tools.infer_digit_classifier import load_model
+    from tools.train_digit_classifier import SmallDigitCNN  # noqa: F401
+
+    use_cuda = bool(args.gpu and torch.cuda.is_available())
+    device = torch.device('cuda' if use_cuda else 'cpu')
+    print(f'Device: {device}', flush=True)
+    model, idx_to_class, img_size = load_model(args.checkpoint, device)
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    print(f'Classes: {[idx_to_class[i] for i in range(len(idx_to_class))]}',
+          flush=True)
+
+    n_hit = classify_from_jpegs(
+        frame_paths, jobs_by_frame, frag_state,
+        model, transform, device, idx_to_class, args.upscale)
+    print(f'  Classified from {n_hit} JPEG frame(s)', flush=True)
+
+    if not args.keep_frames and not args.skip_extract:
+        # keep frames by default for resume; only delete if user wants later
+        pass
 
     results = []
     for tid in [int(e['id']) for e in eligible]:
@@ -582,7 +512,6 @@ def main() -> None:
     print(f'  Fragments probed              : {n_probed}')
     print(f'  Any digit read                : {n_any} ({pct_any:.1f}%)')
     print(f'  Consistent (3+ & >=60% agree) : {n_cons} ({pct_cons:.1f}%)')
-    print('\n  Majority number distribution by team:')
     for team_key in sorted(by_team.keys()):
         dist = by_team[team_key]
         print(f'    {team_key}: {len(dist)} distinct, top={dist.most_common(12)}')
@@ -594,9 +523,7 @@ def main() -> None:
     else:
         verdict = (f'MARGINAL ({pct_cons:.1f}% consistent) — '
                    f'eyeball contact sheet; compare to OCR ~18.5%')
-
     print(f'\n  Verdict: {verdict}')
-    print('  Compare: OCR v5 was ~18.5% consistent on same clip/eligibility.')
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.out_dir / 'jersey_digit_report.json'
