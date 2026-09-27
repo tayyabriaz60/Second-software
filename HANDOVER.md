@@ -562,6 +562,29 @@ python tools/train_digit_classifier.py \
 Check **`runs/digit_cls_v1/val_metrics.json`** — class **10** and **28** matter most.
 Then offline inference on probe frags (178, …) before touching `assign_identities.py`.
 
+### Digit classifier full-clip probe (step 3 — CPU ok)
+
+Same fragments / sample frames as OCR v5 via `--replay-report` (fair % compare):
+
+```bash
+cd /workspace/Second-software && git pull
+cd sports-main/examples/soccer
+export PYTHONPATH=/workspace/Second-software/sports-main
+source /workspace/venv_jersey_paddle/bin/activate
+
+ls -la runs/digit_cls_v2/best.pt
+
+python tools/jersey_digit_probe.py \
+  --dump data/id_lists/track_dump_clip10min_deliver_v2.json \
+  --video /workspace/clip10min.mp4 \
+  --checkpoint runs/digit_cls_v2/best.pt \
+  --replay-report data/jersey_ocr_v5/jersey_ocr_report.json \
+  --out-dir data/jersey_digit_v1
+```
+
+Outputs: `jersey_digit_report.json` + contact sheet under `--out-dir`.
+CPU decode can take 1–3 hours; compare `pct_consistent` to OCR v5 ~18.5%.
+
 ### RunPod: fix cv2/numpy after a bad Paddle pip install
 
 Installing Paddle in the **same** env as the tracking stack often breaks OpenCV:
