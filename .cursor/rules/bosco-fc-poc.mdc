@@ -1,0 +1,20 @@
+---
+description: Bosco FC Sean PoC context — client goals, deliver_v2 metrics, jersey path, RunPod safety
+alwaysApply: true
+---
+
+# Bosco FC panoramic tracking PoC
+
+Read `HANDOVER.md` and repo root `CLAUDE.md` for full context.
+
+**Client:** Sean. **Goal:** stable IDs across ~10 min clip (~23 roster), not 168 merged IDs. **Clip:** 4096×1152, both teams blue. **Canonical run:** `deliver_v2` on `clip10min.mp4`.
+
+**Shipped to client:** `bosco_clip10min_deliver_v2_data` (track dump, CSVs, identity map). Do not re-run full tracking without reason.
+
+**Jersey status:** OCR batch ~13.3% consistent (90 frags); digit cls collapsed to "10"; merger anchors not live. Next: batched OCR part2, merge reports, balanced train, probe code fix, `assign_identities` jersey anchors, before/after count.
+
+**CV engineering:** centre-torso OCR crops; dump frame = clip-relative + start_frame; physics guard refusals are real; team 0/1 weak on dual blue. No full 4472-frame OCR decode on 4K (OOM). Minimize diffs; match repo conventions.
+
+**Paths:** `sports-main/examples/soccer`, `PYTHONPATH=sports-main`, RunPod `/workspace/Second-software`.
+
+**GitHub:** tayyabriaz60/Second-software. Commit only when user asks.
