@@ -1671,6 +1671,9 @@ def main() -> None:
                          'jersey_ocr_report.json; contact sheet keeps that order')
     ap.add_argument('--only-fragments', type=str, default=None,
                     help='Comma-separated fragment ids to probe')
+    ap.add_argument('--exclude-report', type=Path, action='append', default=None,
+                    help='Skip fragment ids already probed in this report (repeatable). '
+                         'Use for batch 2+ so batches do not overlap.')
     ap.add_argument('--debug-fragment', type=int, default=None,
                     help='Print/write pre-merge EasyOCR boxes for this fragment id')
     ap.add_argument('--debug-only', action='store_true',
@@ -1745,6 +1748,17 @@ def main() -> None:
         if missing:
             print(f'  replay-report: {len(missing)} id(s) not eligible now: '
                   f'{sorted(missing)[:20]}...')
+
+    if args.exclude_report:
+        excluded: set[int] = set()
+        for rp in args.exclude_report:
+            prior = json.loads(Path(rp).read_text(encoding='utf-8'))
+            for f in prior.get('fragments') or []:
+                excluded.add(int(f['fragment_id']))
+        n_before = len(eligible)
+        eligible = [e for e in eligible if int(e['id']) not in excluded]
+        print(f'  exclude-report: dropped {n_before - len(eligible)} '
+              f'already-probed fragment(s), {len(eligible)} remain')
 
     if args.max_fragments and len(eligible) > args.max_fragments and not replay_ids:
         rng = random.Random(args.seed)

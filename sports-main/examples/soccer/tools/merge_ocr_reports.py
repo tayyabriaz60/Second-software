@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """Merge jersey_ocr_probe reports (e.g. part1 + part2 batches).
 
-Pools per_sample reads by fragment_id, dedupes on (fragment_id, frame),
-recomputes consistency with the same rules as jersey_ocr_probe.py, and flags
-pre-merge majority disagreements between inputs.
+Pools per_sample reads by fragment_id; first source to sample a frame wins
+(no double-count across batches). Recomputes consistency with the same rules
+as jersey_ocr_probe.py, and flags pre-merge majority disagreements.
 
 Usage (from sports-main/examples/soccer):
   python tools/merge_ocr_reports.py \\
     --report part1=data/jersey_ocr_v5_part1/jersey_ocr_report.json \\
     --report part2=data/jersey_ocr_v5_part2/jersey_ocr_report.json \\
     --out data/jersey_ocr_v5/jersey_ocr_report.json
-
-Self-test (merged pct should match single report):
-  python tools/merge_ocr_reports.py \\
-    --report a=data/jersey_ocr_v5_part1/jersey_ocr_report.json \\
-    --report b=data/jersey_ocr_v5_part1/jersey_ocr_report.json \\
-    --out /tmp/merged_self.json
 """
 from __future__ import annotations
 
@@ -31,32 +25,50 @@ if str(_SOC) not in sys.path:
 
 from tools.jersey_ocr_probe import is_consistent, majority_stats
 
-
-def _read_key(r: dict) -> tuple:
-    return (int(r['number']), round(float(r['confidence']), 3))
+_COMPAT_PARAMS = (
+    'ocr_engine', 'upscale', 'ocr_preprocess', 'min_h', 'min_large_frames',
+    'max_samples', 'torso_width_margin', 'no_ocr_paragraph',
+    'include_referees', 'referee_class',
+)
 
 
 def merge_per_sample(samples: list[dict]) -> list[dict]:
-    """Dedupe frames; combine reads on the same frame across inputs."""
+    """First source to sample a frame wins; skip later sources for that frame."""
     by_frame: dict[int, dict] = {}
     for ps in samples:
         fnum = int(ps['frame'])
-        reads = list(ps.get('reads') or [])
-        if fnum not in by_frame:
-            by_frame[fnum] = {
-                'frame': fnum,
-                'h': ps.get('h'),
-                'reads': [],
-            }
-            seen: set[tuple] = set()
-        else:
-            seen = {_read_key(r) for r in by_frame[fnum]['reads']}
-        for r in reads:
-            k = _read_key(r)
-            if k not in seen:
-                by_frame[fnum]['reads'].append(r)
-                seen.add(k)
+        if fnum in by_frame:
+            continue
+        by_frame[fnum] = {
+            'frame': fnum,
+            'h': ps.get('h'),
+            'reads': list(ps.get('reads') or []),
+        }
     return [by_frame[f] for f in sorted(by_frame.keys())]
+
+
+def check_compatible(labeled: list[tuple[str, dict]]) -> list[str]:
+    if len(labeled) < 2:
+        return []
+    problems: list[str] = []
+    ref_label, ref = labeled[0]
+    ref_params = ref.get('params') or {}
+    ref_crop = ref.get('crop_settings')
+    ref_dump = Path(ref.get('dump') or '').name
+    for label, report in labeled[1:]:
+        params = report.get('params') or {}
+        for key in _COMPAT_PARAMS:
+            if params.get(key) != ref_params.get(key):
+                problems.append(
+                    f'{label} vs {ref_label}: params.{key} '
+                    f'{params.get(key)!r} != {ref_params.get(key)!r}')
+        if (report.get('crop_settings') or {}) != (ref_crop or {}):
+            problems.append(f'{label} vs {ref_label}: crop_settings differ')
+        dump_name = Path(report.get('dump') or '').name
+        if dump_name != ref_dump:
+            problems.append(
+                f'{label} vs {ref_label}: dump {dump_name!r} != {ref_dump!r}')
+    return problems
 
 
 def fragment_from_pooled(base: dict, per_sample: list[dict]) -> dict:
@@ -111,7 +123,13 @@ def merge_reports(labeled: list[tuple[str, dict]]) -> tuple[dict, list[dict]]:
         m = {int(f['fragment_id']): f for f in report.get('fragments') or []}
         frag_by_label.append((label, m))
 
-    all_ids = sorted({fid for _, m in frag_by_label for fid in m.keys()})
+    source_count: Counter[int] = Counter()
+    for _label, m in frag_by_label:
+        for fid in m:
+            source_count[fid] += 1
+    n_multi_source = sum(1 for c in source_count.values() if c > 1)
+
+    all_ids = sorted(source_count.keys())
 
     conflicts: list[dict] = []
     for fid in all_ids:
@@ -171,6 +189,7 @@ def merge_reports(labeled: list[tuple[str, dict]]) -> tuple[dict, list[dict]]:
         'merge_sources': [lab for lab, _ in labeled],
         'summary': {
             'fragments_probed': n_probed,
+            'fragments_in_multiple_sources': n_multi_source,
             'any_read': n_any,
             'consistent': n_cons,
             'pct_any_read': round(pct_any, 2),
@@ -191,6 +210,8 @@ def main() -> None:
         '--report', action='append', required=True, metavar='LABEL=PATH',
         help='Input report (repeatable), e.g. part1=data/.../jersey_ocr_report.json')
     ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--allow-mismatch', action='store_true',
+                    help='Merge even if params/crop/dump differ between reports')
     args = ap.parse_args()
 
     labeled: list[tuple[str, dict]] = []
@@ -204,6 +225,15 @@ def main() -> None:
         report = json.loads(path.read_text(encoding='utf-8'))
         labeled.append((label.strip(), report))
 
+    problems = check_compatible(labeled)
+    if problems:
+        for p in problems:
+            print(p)
+        if not args.allow_mismatch:
+            raise SystemExit(
+                'Refusing to pool reports with mismatched settings '
+                '(use --allow-mismatch)')
+
     merged, conflicts = merge_reports(labeled)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(merged, indent=2), encoding='utf-8')
@@ -213,6 +243,7 @@ def main() -> None:
     print(f'  Sources                       : {merged["merge_sources"]}')
     print(f'  Output                        : {args.out}')
     print(f'  Fragments probed              : {s["fragments_probed"]}')
+    print(f'  ...in more than one source    : {s["fragments_in_multiple_sources"]}')
     print(f'  Any digit read                : {s["any_read"]} ({s["pct_any_read"]}%)')
     print(f'  Consistent (3+ & >=60% agree) : {s["consistent"]} ({s["pct_consistent"]}%)')
     print(f'  Verdict                       : {s["verdict"]}')
